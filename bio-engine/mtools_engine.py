@@ -59,7 +59,7 @@ async def add_eln_log(entry: LogEntry):
 # ==========================================
 class SampleAddEntry(BaseModel):
     box_id: str
-    well_index: str         # 🚨 致命修复：必须从 int 改为 str
+    well_index: str
     sample_name: str
     sample_type: str
     vol: float
@@ -67,12 +67,14 @@ class SampleAddEntry(BaseModel):
     ft_count: int
     owner: str
     notes: Optional[str] = ""
+    x: float = 20.0  # 🚨 新增：默认生成的 X 坐标
+    y: float = 20.0  # 🚨 新增：默认生成的 Y 坐标
 
 @app.post("/api/samples/add")
 async def add_sample(entry: SampleAddEntry):
     import datetime
     sample_info = {
-        "id": f"SPL-{entry.well_index}", # 🚨 适配新的字符串编号
+        "id": f"SPL-{entry.well_index}",
         "name": entry.sample_name,
         "type": entry.sample_type,
         "vol": entry.vol,
@@ -80,10 +82,27 @@ async def add_sample(entry: SampleAddEntry):
         "ft": entry.ft_count,
         "owner": entry.owner,
         "notes": entry.notes,
+        "x": entry.x,  # 🚨 存入坐标
+        "y": entry.y,  # 🚨 存入坐标
         "deposit_time": datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     }
     sample_logic.update_item(entry.box_id, entry.well_index, sample_info)
     return {"code": 200, "message": "物理入库成功"}
+
+class ItemMoveEntry(BaseModel):
+    box_id: str
+    well_index: str
+    x: float
+    y: float
+
+@app.post("/api/samples/move_item")
+async def move_item(entry: ItemMoveEntry):
+    if entry.box_id in sample_logic.items and entry.well_index in sample_logic.items[entry.box_id]:
+        sample_logic.items[entry.box_id][entry.well_index]["x"] = entry.x
+        sample_logic.items[entry.box_id][entry.well_index]["y"] = entry.y
+        sample_logic.save_data()
+        return {"code": 200}
+    return {"code": 404}
 
 # 🚨 新增：蓝图建造相关的 Pydantic 模型
 class ContainerAddEntry(BaseModel):
