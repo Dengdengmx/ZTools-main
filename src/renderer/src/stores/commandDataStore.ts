@@ -1,0 +1,1298 @@
+import Fuse from 'fuse.js'
+import { defineStore } from 'pinia'
+import { pinyin } from 'pinyin-pro'
+import { ref } from 'vue'
+import arrowBackwardIcon from '../assets/image/arrow-backward.png'
+import settingsFillIcon from '../assets/image/settings-fill.png'
+import {
+  getCommandId as _getCommandId,
+  applySpecialConfig as _applySpecialConfig,
+  calculateMatchScore as _calculateMatchScore
+} from './commandUtils'
+
+// 正则匹配指令
+interface RegexCmd {
+  type: 'regex'
+  minLength: number
+  match: string
+  label: string
+}
+
+// Over 匹配指令
+interface OverCmd {
+  type: 'over'
+  label: string
+  exclude?: string // 排除的正则表达式字符串
+  minLength?: number // 最少字符数
+  maxLength?: number // 最多字符数，默认 10000
+}
+
+// Img 匹配指令
+interface ImgCmd {
+  type: 'img'
+  label: string
+}
+
+// Files 匹配指令
+interface FilesCmd {
+  type: 'files'
+  label: string
+  fileType?: 'file' | 'directory' // 文件类型
+  extensions?: string[] // 文件扩展名
+  match?: string // 匹配文件(夹)名称的正则表达式字符串
+  minLength?: number // 最少文件数
+  maxLength?: number // 最多文件数
+}
+
+// Window 匹配指令
+interface WindowCmd {
+  type: 'window'
+  label: string
+  match: {
+    app?: string[] // 匹配应用名称列表（如 ["Finder.app"]）
+    title?: string // 匹配窗口标题的正则表达式字符串
+  }
+}
+
+// 匹配指令联合类型
+type MatchCmd = RegexCmd | OverCmd | ImgCmd | FilesCmd | WindowCmd
+
+// 指令类型枚举
+export type CommandType =
+  | 'direct' // 直接启动（app + system-setting）
+  | 'plugin' // 插件功能
+  | 'builtin' // 内置功能
+
+// 子类型（用于区分 direct 类型的具体来源）
+export type CommandSubType =
+  | 'app' // 系统应用
+  | 'system-setting' // 系统设置
+  | 'local-shortcut' // 本地启动项
+
+// Command 接口（原 App 接口）
+export interface Command {
+  name: string
+  path: string // 纯路径（应用路径 或 插件根目录路径）
+  icon?: string
+  aliases?: string[]
+  pinyin?: string
+  pinyinAbbr?: string
+  acronym?: string // 英文首字母缩写（用于搜索）
+  type: CommandType // 指令类型
+  subType?: CommandSubType // 子类型（用于区分 direct 类型）
+  featureCode?: string // 插件功能代码（用于启动时指定功能）
+  pluginName?: string // 插件名称（仅插件类型有效）
+  pluginTitle?: string // 插件标题（仅插件类型有效）
+  pluginExplain?: string // 插件功能说明
+  matchCmd?: MatchCmd // 匹配指令配置（regex 或 over 或 img 或 files）
+  cmdType?: 'text' | 'regex' | 'over' | 'img' | 'files' // cmd类型
+  mainPush?: boolean // 是否为 mainPush 功能（搜索时动态查询插件获取结果）
+  matches?: MatchInfo[] // 搜索匹配信息（用于高亮显示）
+  matchType?: 'acronym' | 'name' | 'pinyin' | 'pinyinAbbr' // 匹配类型（用于高亮算法选择）
+  // 系统设置字段（新增）
+  settingUri?: string // ms-settings URI
+  category?: string // 分类（用于分组显示）
+  confirmDialog?: any // 确认对话框配置
+}
+
+// MainPush 功能信息
+export interface MainPushFeature {
+  pluginPath: string
+  pluginName: string
+  pluginLogo: string
+  featureCode: string
+  featureExplain: string
+  featureIcon?: string
+  cmds: any[]
+}
+
+interface MatchInfo {
+  indices: Array<[number, number]>
+  value: string
+  key: string
+}
+
+export interface SearchResult extends Command {
+  matches?: MatchInfo[]
+}
+
+interface HistoryItem extends Command {
+  lastUsed: number // 时间戳
+  useCount: number // 使用次数
+}
+
+const HISTORY_DOC_ID = 'command-history'
+const PINNED_DOC_ID = 'pinned-commands'
+
+export const useCommandDataStore = defineStore('commandData', () => {
+  // ===== 特殊指令配置表 =====
+  // 支持两种匹配方式：
+  // 1. 通过 path 精确匹配（如 'special:last-match'）
+  // 2. 通过 subType 匹配（如 'subType:system-setting'）
+  const specialCommands: Record<string, Partial<Command>> = {
+    'special:last-match': {
+      name: '上次匹配',
+      icon: arrowBackwardIcon,
+      type: 'builtin',
+      cmdType: 'text'
+    },
+    'subType:system-setting': {
+      icon: settingsFillIcon
+    }
+  }
+
+  /**
+   * 应用特殊指令配置
+   * @param command 原始指令
+   * @returns 应用了特殊配置的指令
+   */
+  function applySpecialConfig(command: Command): Command {
+    return _applySpecialConfig(command, specialCommands)
+  }
+
+  // 历史记录
+  const history = ref<HistoryItem[]>([])
+  // 固定指令
+  const pinnedCommands = ref<Command[]>([])
+  // 指令列表（用于搜索）
+  const commands = ref<Command[]>([]) // 用于 Fuse 模糊搜索的指令列表
+  const regexCommands = ref<Command[]>([]) // 只用正则匹配的指令列表
+  const mainPushFeatures = ref<MainPushFeature[]>([]) // mainPush 功能列表
+  const loading = ref(false)
+  const fuse = ref<Fuse<Command> | null>(null)
+  // 是否已初始化
+  const isInitialized = ref(false)
+  // 标记是否是本地触发的更新（用于避免重复加载）
+  let isLocalPinnedUpdate = false
+  // 禁用指令列表
+  const disabledCommands = ref<string[]>([])
+  const DISABLED_COMMANDS_KEY = 'disable-commands'
+  // 搜索偏好记录（搜索词 -> 上次选中的指令标识）
+  const searchPreference = ref<
+    Record<string, { path: string; featureCode?: string; name: string }>
+  >({})
+
+  // 超级面板固定列表缓存
+  const superPanelPinned = ref<any[]>([])
+
+  async function loadSuperPanelPinnedData(): Promise<void> {
+    try {
+      superPanelPinned.value = await window.ztools.getSuperPanelPinned()
+    } catch {
+      superPanelPinned.value = []
+    }
+  }
+
+  function isPinnedToSuperPanel(app: any): boolean {
+    return superPanelPinned.value.some((item) => {
+      if (app.featureCode) {
+        return item.path === app.path && item.featureCode === app.featureCode
+      }
+      return item.path === app.path && item.name === app.name
+    })
+  }
+
+  // 生成指令唯一标识（与设置插件保持一致）
+  // 格式: pluginName:featureCode:cmdName:cmdType
+  function getCommandId(cmd: Command): string {
+    return _getCommandId(cmd)
+  }
+
+  // 检查指令是否被禁用
+  function isCommandDisabled(cmd: Command): boolean {
+    const id = getCommandId(cmd)
+    return disabledCommands.value.includes(id)
+  }
+
+  // 加载禁用指令列表
+  async function loadDisabledCommands(): Promise<void> {
+    try {
+      const data = await window.ztools.dbGet(DISABLED_COMMANDS_KEY)
+      if (data && Array.isArray(data)) {
+        disabledCommands.value = data
+      }
+    } catch (error) {
+      console.error('加载禁用指令列表失败:', error)
+    }
+  }
+
+  // 加载搜索偏好记录
+  async function loadSearchPreference(): Promise<void> {
+    try {
+      const data = await window.ztools.dbGet('search-preference')
+      if (data && typeof data === 'object') {
+        searchPreference.value = data
+      }
+    } catch (error) {
+      console.error('加载搜索偏好记录失败:', error)
+    }
+  }
+
+  // 保存搜索偏好（搜索词 -> 选中的指令）
+  async function saveSearchPreference(
+    query: string,
+    command: { path: string; featureCode?: string; name: string }
+  ): Promise<void> {
+    const key = query.trim().toLowerCase()
+    if (!key) return
+
+    searchPreference.value[key] = {
+      path: command.path,
+      featureCode: command.featureCode,
+      name: command.name
+    }
+    try {
+      await window.ztools.dbPut(
+        'search-preference',
+        JSON.parse(JSON.stringify(searchPreference.value))
+      )
+    } catch (error) {
+      console.error('保存搜索偏好失败:', error)
+    }
+  }
+
+  // 从数据库加载所有数据（仅在初始化时调用一次）
+  async function initializeData(): Promise<void> {
+    if (isInitialized.value) {
+      return
+    }
+
+    try {
+      // 先加载禁用指令列表和指令列表，再加载历史记录和固定列表（历史记录清理需要依赖指令列表）
+      await loadDisabledCommands()
+      await loadCommands()
+      await Promise.all([
+        loadHistoryData(),
+        loadPinnedData(),
+        loadSearchPreference(),
+        loadSuperPanelPinnedData()
+      ])
+
+      // 监听后端历史记录变化事件
+      window.ztools.onHistoryChanged(() => {
+        loadHistoryData()
+      })
+
+      // 监听指令列表变化事件（应用文件夹变化时触发）
+      window.ztools.onAppsChanged(() => {
+        loadCommands()
+      })
+
+      // 监听固定列表变化事件
+      window.ztools.onPinnedChanged(() => {
+        // 如果是本地触发的更新，忽略此事件，避免重复加载
+        if (isLocalPinnedUpdate) {
+          isLocalPinnedUpdate = false
+          return
+        }
+        loadPinnedData()
+      })
+
+      // 监听超级面板固定列表变化事件
+      window.ztools.onSuperPanelPinnedChanged(() => {
+        loadSuperPanelPinnedData()
+      })
+
+      // 监听禁用指令列表变化事件
+      window.ztools.onDisabledCommandsChanged(() => {
+        loadDisabledCommands()
+      })
+
+      isInitialized.value = true
+    } catch (error) {
+      console.error('初始化指令数据失败:', error)
+      history.value = []
+      pinnedCommands.value = []
+      commands.value = []
+      regexCommands.value = []
+      isInitialized.value = true
+    }
+  }
+
+  // 加载历史记录数据
+  async function loadHistoryData(): Promise<void> {
+    try {
+      const data = await window.ztools.dbGet(HISTORY_DOC_ID)
+
+      if (data && Array.isArray(data)) {
+        // 创建当前所有指令的 path Set（用于验证历史记录是否仍然有效）
+        const currentCommandPaths = new Set(commands.value.map((cmd) => cmd.path))
+
+        // 过滤掉已卸载的插件、无效的指令，并清理系统设置的旧图标路径
+        const filteredData = data
+          .filter((item: any) => {
+            // 特殊指令不检查，直接保留
+            if (item.path === 'special:last-match') {
+              return true
+            }
+
+            // 检查所有类型的历史记录（包括插件、应用、系统设置等）
+            // 如果在当前指令列表中找不到，就清理掉
+            if (!currentCommandPaths.has(item.path)) {
+              return false
+            }
+
+            return true
+          })
+          .map((item: any) => {
+            const cleanedItem = { ...item }
+
+            // 1. 迁移旧的系统设置数据格式：type: "system-setting" -> type: "direct", subType: "system-setting"
+            if (item.type === 'system-setting') {
+              cleanedItem.type = 'direct'
+              cleanedItem.subType = 'system-setting'
+            }
+
+            // 2. 清理系统设置和特殊指令的旧图标路径
+            if (
+              (cleanedItem.type === 'direct' && cleanedItem.subType === 'system-setting') ||
+              cleanedItem.path?.startsWith('special:')
+            ) {
+              if (cleanedItem.icon) {
+                delete cleanedItem.icon
+              }
+            }
+
+            return cleanedItem
+          })
+
+        // 直接赋值，避免先清空再设置导致的闪烁
+        history.value = filteredData
+      } else {
+        history.value = []
+      }
+    } catch (error) {
+      console.error('加载历史记录失败:', error)
+      history.value = []
+    }
+  }
+
+  // 加载固定列表数据
+  async function loadPinnedData(): Promise<void> {
+    try {
+      const [data, plugins] = await Promise.all([
+        window.ztools.dbGet(PINNED_DOC_ID),
+        window.ztools.getAllPlugins()
+      ])
+
+      if (data && Array.isArray(data)) {
+        // 获取所有已安装插件的路径 Set
+        const installedPluginPaths = new Set(plugins.map((p: any) => p.path))
+
+        // 过滤掉已卸载的插件
+        const filteredData = data.filter((item: any) => {
+          if (item.type === 'plugin') {
+            return installedPluginPaths.has(item.path)
+          }
+          return true
+        })
+
+        pinnedCommands.value = filteredData
+      } else {
+        pinnedCommands.value = []
+      }
+    } catch (error) {
+      console.error('加载固定列表失败:', error)
+      pinnedCommands.value = []
+    }
+  }
+
+  // 重新加载历史记录和固定列表（用于插件卸载后刷新）
+  async function reloadUserData(): Promise<void> {
+    await Promise.all([loadHistoryData(), loadPinnedData()])
+  }
+
+  // 加载指令列表
+  async function loadCommands(): Promise<void> {
+    loading.value = true
+    try {
+      const [rawApps, plugins] = await Promise.all([
+        window.ztools.getApps(),
+        window.ztools.getAllPlugins() // 使用 getAllPlugins 获取所有插件（包括 system）
+      ])
+
+      // 处理本地应用指令
+      const appItems = rawApps.flatMap((app) => {
+        // 类型断言：后端可能返回扩展字段（type, subType）
+        const extendedApp = app as any
+        const baseApp = {
+          ...app,
+          // 保留已有的 type 和 subType（用于内置指令），否则使用默认值
+          type: extendedApp.type || ('direct' as const),
+          subType: extendedApp.subType || ('app' as const),
+          pinyin: pinyin(app.name, { toneType: 'none', type: 'string' })
+            .replace(/\s+/g, '')
+            .toLowerCase(),
+          pinyinAbbr: pinyin(app.name, { pattern: 'first', toneType: 'none', type: 'string' })
+            .replace(/\s+/g, '')
+            .toLowerCase()
+        }
+        const result = [baseApp]
+        // 如果有别名（如本地化名称），为每个别名生成一个独立的指令
+        if (extendedApp.aliases && Array.isArray(extendedApp.aliases)) {
+          for (const alias of extendedApp.aliases) {
+            if (alias && alias !== extendedApp.name) {
+              result.push({
+                ...baseApp,
+                name: alias,
+                pinyin: pinyin(alias, { toneType: 'none', type: 'string' })
+                  .replace(/\s+/g, '')
+                  .toLowerCase(),
+                pinyinAbbr: pinyin(alias, { pattern: 'first', toneType: 'none', type: 'string' })
+                  .replace(/\s+/g, '')
+                  .toLowerCase()
+              })
+            }
+          }
+        }
+
+        return result
+      })
+
+      // 处理插件：每个 cmd 转换为一个独立指令
+      const pluginItems: Command[] = [] // 普通插件指令
+      const regexItems: Command[] = [] // 正则匹配指令
+      const mainPushItems: MainPushFeature[] = [] // mainPush 功能列表
+
+      for (const plugin of plugins) {
+        if (plugin.features && Array.isArray(plugin.features) && plugin.features.length > 0) {
+          // 检查是否有 feature 的 cmd 名称与插件名称相同
+          const hasPluginNameCmd = plugin.features.some((feature: any) =>
+            feature.cmds?.some(
+              (cmd: any) =>
+                (typeof cmd === 'string' ? cmd : cmd.label) === (plugin.title ?? plugin.name)
+            )
+          )
+
+          // 1. 插件名称本身作为一个指令（不关联具体 feature）
+          // 如果已经有同名的 feature cmd，则跳过插件名称指令，避免重复
+          if (!hasPluginNameCmd) {
+            let defaultFeatureCode: string | undefined = undefined
+            let defaultFeatureExplain: string | undefined = undefined
+            // 如果插件没有指定 main，则默认启动第一个非匹配指令的功能
+            if (!plugin.main && plugin.features) {
+              for (const feature of plugin.features) {
+                if (feature.cmds && Array.isArray(feature.cmds)) {
+                  // 查找是否存在字符串类型的指令（即普通文本指令）
+                  const hasTextCmd = feature.cmds.some((cmd: any) => typeof cmd === 'string')
+                  if (hasTextCmd) {
+                    defaultFeatureCode = feature.code
+                    defaultFeatureExplain = feature.explain
+                    break
+                  }
+                }
+              }
+            }
+
+            pluginItems.push({
+              name: plugin.title ?? plugin.name,
+              path: plugin.path,
+              icon: plugin.logo,
+              type: 'plugin',
+              featureCode: defaultFeatureCode,
+              pluginName: plugin.name,
+              pluginTitle: plugin.title,
+              pluginExplain: defaultFeatureExplain || plugin.description,
+              pinyin: pinyin(plugin.name, { toneType: 'none', type: 'string' })
+                .replace(/\s+/g, '')
+                .toLowerCase(),
+              pinyinAbbr: pinyin(plugin.name, {
+                pattern: 'first',
+                toneType: 'none',
+                type: 'string'
+              })
+                .replace(/\s+/g, '')
+                .toLowerCase()
+            })
+          }
+
+          // 2. 每个 feature 的每个 cmd 都作为独立的指令
+          for (const feature of plugin.features) {
+            if (feature.cmds && Array.isArray(feature.cmds)) {
+              // 优先使用 feature 的 icon，如果没有则使用 plugin 的 logo
+              const featureIcon = feature.icon || plugin.logo
+              const isMainPush = !!feature.mainPush
+
+              // 收集 mainPush 功能信息
+              if (isMainPush) {
+                mainPushItems.push({
+                  pluginPath: plugin.path,
+                  pluginName: plugin.name,
+                  pluginLogo: plugin.logo || '',
+                  featureCode: feature.code,
+                  featureExplain: feature.explain || '',
+                  featureIcon: featureIcon,
+                  cmds: feature.cmds
+                })
+              }
+
+              for (const cmd of feature.cmds) {
+                // cmd 可能是字符串（功能指令）或对象（匹配指令）
+                const isMatchCmd =
+                  typeof cmd === 'object' &&
+                  ['regex', 'over', 'img', 'files', 'window'].includes(cmd.type)
+                const cmdName = isMatchCmd ? cmd.label : cmd
+
+                if (isMatchCmd) {
+                  // 匹配指令项（regex、over、img、files、window）：也需要拼音搜索
+                  regexItems.push({
+                    name: cmdName,
+                    path: plugin.path,
+                    icon: featureIcon,
+                    type: 'plugin',
+                    featureCode: feature.code,
+                    pluginName: plugin.name,
+                    pluginTitle: plugin.title,
+                    pluginExplain: feature.explain,
+                    matchCmd: cmd,
+                    cmdType: cmd.type, // 标记匹配类型
+                    mainPush: isMainPush,
+                    pinyin: pinyin(cmdName, { toneType: 'none', type: 'string' })
+                      .replace(/\s+/g, '')
+                      .toLowerCase(),
+                    pinyinAbbr: pinyin(cmdName, {
+                      pattern: 'first',
+                      toneType: 'none',
+                      type: 'string'
+                    })
+                      .replace(/\s+/g, '')
+                      .toLowerCase()
+                  })
+                } else {
+                  // 功能指令（文本类型）
+                  pluginItems.push({
+                    name: cmdName,
+                    path: plugin.path,
+                    icon: featureIcon,
+                    type: 'plugin',
+                    featureCode: feature.code,
+                    pluginName: plugin.name,
+                    pluginTitle: plugin.title,
+                    pluginExplain: feature.explain,
+                    cmdType: 'text', // 标记为文本类型
+                    mainPush: isMainPush,
+                    pinyin: pinyin(cmdName, { toneType: 'none', type: 'string' })
+                      .replace(/\s+/g, '')
+                      .toLowerCase(),
+                    pinyinAbbr: pinyin(cmdName, {
+                      pattern: 'first',
+                      toneType: 'none',
+                      type: 'string'
+                    })
+                      .replace(/\s+/g, '')
+                      .toLowerCase()
+                  })
+                }
+              }
+            }
+          }
+        }
+      }
+
+      // 3. 加载系统设置（仅 Windows 平台）
+      let settingCommands: Command[] = []
+      try {
+        const isWindows = window.ztools.getPlatform() === 'win32'
+        if (isWindows) {
+          const settings = await window.ztools.getSystemSettings()
+          settingCommands = settings.map((s: any) => ({
+            name: s.name,
+            path: s.uri,
+            icon: settingsFillIcon, // 使用前端统一图标
+            type: 'direct' as const,
+            subType: 'system-setting' as const,
+            settingUri: s.uri,
+            category: s.category,
+            confirmDialog: s.confirmDialog, // 传递确认对话框配置
+            pinyin: pinyin(s.name, { toneType: 'none', type: 'string' })
+              .replace(/\s+/g, '')
+              .toLowerCase(),
+            pinyinAbbr: pinyin(s.name, { pattern: 'first', toneType: 'none', type: 'string' })
+              .replace(/\s+/g, '')
+              .toLowerCase()
+          }))
+        }
+      } catch (error) {
+        console.error('加载系统设置失败:', error)
+      }
+
+      // 4. 加载本地启动项
+      let localShortcuts: Command[] = []
+      try {
+        const shortcuts = await window.ztools.localShortcuts.getAll()
+        localShortcuts = shortcuts.map((s: any) => ({
+          name: s.alias || s.name,
+          path: s.path,
+          icon: s.icon,
+          type: 'direct' as const,
+          subType: 'local-shortcut' as const,
+          pinyin: s.pinyin || '',
+          pinyinAbbr: s.pinyinAbbr || '',
+          cmdType: 'text' as const
+        }))
+      } catch (error) {
+        console.error('加载本地启动项失败:', error)
+      }
+
+      // 合并所有指令
+      commands.value = [...appItems, ...pluginItems, ...settingCommands, ...localShortcuts]
+      regexCommands.value = regexItems
+      mainPushFeatures.value = mainPushItems
+
+      console.log(
+        `加载了 ${appItems.length} 个应用指令, ${pluginItems.length} 个插件指令, ${settingCommands.length} 个系统设置指令, ${localShortcuts.length} 个本地启动项, ${regexItems.length} 个匹配指令`
+      )
+
+      // 初始化 Fuse.js 搜索引擎
+      fuse.value = new Fuse(commands.value, {
+        keys: [
+          { name: 'name', weight: 2 }, // 名称权重最高
+          { name: 'pinyin', weight: 1.5 }, // 拼音
+          { name: 'pinyinAbbr', weight: 1 }, // 拼音首字母
+          { name: 'acronym', weight: 1.5 } // 英文首字母缩写
+        ],
+        threshold: 0, // 严格模式
+        ignoreLocation: true,
+        includeScore: true,
+        includeMatches: true // 包含匹配信息
+      })
+    } catch (error) {
+      console.error('加载指令失败:', error)
+    } finally {
+      loading.value = false
+    }
+  }
+
+  /**
+   * 计算匹配分数（用于排序）
+   * @param text 被匹配的文本
+   * @param query 搜索关键词
+   * @param matches 匹配信息
+   * @param command 指令对象（可选，用于类型加权）
+   * @returns 分数（越高越好）
+   */
+  function calculateMatchScore(
+    text: string,
+    query: string,
+    matches?: MatchInfo[],
+    command?: Command
+  ): number {
+    return _calculateMatchScore(text, query, matches, command)
+  }
+
+  // 搜索
+  function search(
+    query: string,
+    commandList?: SearchResult[]
+  ): { bestMatches: SearchResult[]; regexMatches: SearchResult[] } {
+    // 如果没有指定搜索范围，使用全局指令
+    const searchTarget = commandList || commands.value
+
+    if (!query || !fuse.value) {
+      return {
+        bestMatches: searchTarget.filter((cmd) => cmd.type === 'direct' && cmd.subType === 'app'), // 无搜索时只显示应用
+        regexMatches: []
+      }
+    }
+
+    // 1. Fuse.js 模糊搜索
+    // 搜索词过长时跳过 Fuse.js（应用名/指令名通常很短，超长输入走模糊搜索无意义且浪费性能）
+    const FUSE_MAX_QUERY_LENGTH = 32
+    let bestMatches: SearchResult[] = []
+
+    if (query.length <= FUSE_MAX_QUERY_LENGTH) {
+      // 如果指定了搜索范围，创建临时 Fuse 实例
+      const searchFuse = commandList
+        ? new Fuse(commandList, {
+            keys: [
+              { name: 'name', weight: 2 },
+              { name: 'pinyin', weight: 1.5 },
+              { name: 'pinyinAbbr', weight: 1 },
+              { name: 'acronym', weight: 1.5 }
+            ],
+            threshold: 0,
+            ignoreLocation: true,
+            includeScore: true,
+            includeMatches: true
+          })
+        : fuse.value
+
+      const fuseResults = searchFuse.search(query)
+      bestMatches = fuseResults
+        .map((r) => {
+          // 检测匹配类型（用于前端高亮算法选择）
+          let matchType: 'acronym' | 'name' | 'pinyin' | 'pinyinAbbr' | undefined
+          if (r.matches && r.matches.length > 0) {
+            // 优先级：acronym > name > pinyin > pinyinAbbr
+            if (r.matches.some((m) => m.key === 'acronym')) {
+              matchType = 'acronym'
+            } else if (r.matches.some((m) => m.key === 'name')) {
+              matchType = 'name'
+            } else if (r.matches.some((m) => m.key === 'pinyin')) {
+              matchType = 'pinyin'
+            } else if (r.matches.some((m) => m.key === 'pinyinAbbr')) {
+              matchType = 'pinyinAbbr'
+            }
+          }
+
+          return {
+            ...r.item,
+            matches: r.matches as MatchInfo[],
+            matchType,
+            _score: r.score || 0
+          }
+        })
+        .sort((a, b) => {
+          // 自定义排序：优先连续匹配，系统应用权重略高
+          const scoreA = calculateMatchScore(a.name, query, a.matches, a)
+          const scoreB = calculateMatchScore(b.name, query, b.matches, b)
+          return scoreB - scoreA // 分数高的排前面
+        })
+
+      // 搜索偏好置顶：将上次选中的指令移到第一位
+      const prefKey = query.trim().toLowerCase()
+      const pref = searchPreference.value[prefKey]
+      if (pref) {
+        const prefIndex = bestMatches.findIndex(
+          (cmd) =>
+            cmd.path === pref.path && cmd.featureCode === pref.featureCode && cmd.name === pref.name
+        )
+        if (prefIndex > 0) {
+          const [preferred] = bestMatches.splice(prefIndex, 1)
+          bestMatches.unshift(preferred)
+        }
+      }
+    }
+
+    // 2. 匹配指令匹配（从 regexCommands 中查找，包括 regex 和 over 类型）
+    const regexMatches: SearchResult[] = []
+    for (const cmd of regexCommands.value) {
+      if (cmd.matchCmd) {
+        if (cmd.matchCmd.type === 'regex') {
+          // Regex 类型匹配
+          // 检查用户输入长度是否满足最小要求
+          if (query.length < cmd.matchCmd.minLength) {
+            continue
+          }
+
+          try {
+            // 提取正则表达式（去掉两边的斜杠和标志）
+            const regexStr = cmd.matchCmd.match.replace(/^\/|\/[gimuy]*$/g, '')
+            const regex = new RegExp(regexStr)
+
+            // 测试用户输入是否匹配
+            if (regex.test(query)) {
+              regexMatches.push(cmd)
+            }
+          } catch (error) {
+            console.error(`正则表达式 ${cmd.matchCmd.match} 解析失败:`, error)
+          }
+        } else if (cmd.matchCmd.type === 'over') {
+          // Over 类型匹配
+          const minLength = cmd.matchCmd.minLength ?? 1
+          const maxLength = cmd.matchCmd.maxLength ?? 10000
+
+          // 检查长度是否满足要求
+          if (query.length < minLength || query.length > maxLength) {
+            continue
+          }
+
+          // 检查是否被排除
+          if (cmd.matchCmd.exclude) {
+            try {
+              const excludeRegexStr = cmd.matchCmd.exclude.replace(/^\/|\/[gimuy]*$/g, '')
+              const excludeRegex = new RegExp(excludeRegexStr)
+
+              // 如果匹配到排除规则，跳过
+              if (excludeRegex.test(query)) {
+                continue
+              }
+            } catch (error) {
+              console.error(`排除正则表达式 ${cmd.matchCmd.exclude} 解析失败:`, error)
+            }
+          }
+
+          // 通过所有检查，添加到匹配结果
+          regexMatches.push(cmd)
+        }
+      }
+    }
+
+    // 应用特殊指令配置（确保图标等属性正确）
+    const processedBestMatches = bestMatches
+      .filter((cmd) => !isCommandDisabled(cmd))
+      .map((cmd) => applySpecialConfig(cmd))
+    const processedRegexMatches = regexMatches
+      .filter((cmd) => !isCommandDisabled(cmd))
+      .map((cmd) => applySpecialConfig(cmd))
+
+    // 如果指定了搜索范围（用于粘贴内容的二次搜索），不需要 regexMatches
+    if (commandList) {
+      return { bestMatches: processedBestMatches, regexMatches: [] }
+    }
+
+    // 分别返回模糊匹配和正则匹配结果
+    return { bestMatches: processedBestMatches, regexMatches: processedRegexMatches }
+  }
+
+  // 搜索支持图片的指令
+  function searchImageCommands(): SearchResult[] {
+    const result = regexCommands.value
+      .filter((cmd) => cmd.matchCmd?.type === 'img')
+      .filter((cmd) => !isCommandDisabled(cmd))
+    // 应用特殊指令配置
+    return result.map((cmd) => applySpecialConfig(cmd))
+  }
+
+  // 搜索支持文本的指令（根据文本长度过滤）
+  function searchTextCommands(pastedText?: string): SearchResult[] {
+    if (!pastedText) {
+      return []
+    }
+
+    const result = regexCommands.value.filter((cmd) => {
+      // 支持 over 类型
+      if (cmd.matchCmd?.type === 'over') {
+        const textLength = pastedText.length
+        const minLength = cmd.matchCmd.minLength ?? 1
+        const maxLength = cmd.matchCmd.maxLength ?? 10000
+
+        return textLength >= minLength && textLength <= maxLength
+      }
+
+      // 支持 regex 类型
+      if (cmd.matchCmd?.type === 'regex') {
+        const textLength = pastedText.length
+        const minLength = cmd.matchCmd.minLength ?? 1
+
+        // 检查长度
+        if (textLength < minLength) {
+          return false
+        }
+
+        // 检查正则匹配
+        const regexStr = cmd.matchCmd.match
+        if (regexStr) {
+          try {
+            // 解析正则表达式字符串（格式：/pattern/flags）
+            const match = regexStr.match(/^\/(.+)\/([gimuy]*)$/)
+            if (match) {
+              const pattern = match[1]
+              const flags = match[2]
+              const regex = new RegExp(pattern, flags)
+              return regex.test(pastedText)
+            }
+          } catch (error) {
+            console.error('正则表达式解析失败:', regexStr, error)
+            return false
+          }
+        }
+      }
+
+      return false
+    })
+
+    // 应用特殊指令配置，过滤禁用指令
+    return result.filter((cmd) => !isCommandDisabled(cmd)).map((cmd) => applySpecialConfig(cmd))
+  }
+
+  // 搜索支持文件的指令（根据配置属性过滤）
+  function searchFileCommands(
+    pastedFiles?: Array<{ path: string; name: string; isDirectory: boolean }>
+  ): SearchResult[] {
+    if (!pastedFiles || pastedFiles.length === 0) {
+      return []
+    }
+
+    const filesCommandsList = regexCommands.value.filter((c) => c.matchCmd?.type === 'files')
+
+    const result = filesCommandsList.filter((cmd) => {
+      const filesCmd = cmd.matchCmd as FilesCmd
+
+      // 1. 检查文件数量是否满足要求
+      const fileCount = pastedFiles.length
+      const minLength = filesCmd.minLength ?? 1
+      const maxLength = filesCmd.maxLength ?? 10000
+
+      if (fileCount < minLength || fileCount > maxLength) {
+        return false
+      }
+
+      // 2. 检查每个文件是否满足条件
+      const allFilesMatch = pastedFiles.every((file) => {
+        // 2.1 检查文件类型（file 或 directory）
+        if (filesCmd.fileType) {
+          if (filesCmd.fileType === 'file' && file.isDirectory) {
+            return false
+          }
+          if (filesCmd.fileType === 'directory' && !file.isDirectory) {
+            return false
+          }
+        }
+
+        // 2.2 检查文件扩展名（只对文件有效，不检查文件夹）
+        if (filesCmd.extensions && !file.isDirectory) {
+          const ext = file.name.split('.').pop()?.toLowerCase()
+          const allowedExts = filesCmd.extensions.map((e) => e.toLowerCase())
+          if (!ext || !allowedExts.includes(ext)) {
+            return false
+          }
+        }
+
+        // 2.3 检查正则表达式匹配
+        if (filesCmd.match) {
+          try {
+            // 解析正则表达式字符串（格式：/pattern/flags）
+            const match = filesCmd.match.match(/^\/(.+)\/([gimuy]*)$/)
+            if (match) {
+              const pattern = match[1]
+              const flags = match[2]
+              const regex = new RegExp(pattern, flags)
+              const testResult = regex.test(file.name)
+              if (!testResult) {
+                return false
+              }
+            } else {
+              // 如果不是标准格式，直接作为字符串匹配
+              const testResult = file.name.includes(filesCmd.match)
+              if (!testResult) {
+                return false
+              }
+            }
+          } catch (error) {
+            console.error(`正则表达式 ${filesCmd.match} 解析失败:`, error)
+            return false
+          }
+        }
+
+        return true
+      })
+
+      return allFilesMatch
+    })
+
+    // 应用特殊指令配置，过滤禁用指令
+    return result.filter((cmd) => !isCommandDisabled(cmd)).map((cmd) => applySpecialConfig(cmd))
+  }
+
+  // 搜索支持窗口的指令（根据当前激活窗口进行匹配）
+  function searchWindowCommands(windowInfo?: { app?: string; title?: string }): SearchResult[] {
+    if (!windowInfo || (!windowInfo.app && !windowInfo.title)) {
+      return []
+    }
+
+    const windowCommandsList = regexCommands.value.filter((c) => c.matchCmd?.type === 'window')
+
+    const result = windowCommandsList.filter((cmd) => {
+      const windowCmd = cmd.matchCmd as WindowCmd
+
+      // 检查 app 匹配
+      if (windowCmd.match.app && windowInfo.app) {
+        const appMatches = windowCmd.match.app.some((appPattern) => {
+          // 直接字符串匹配
+          return windowInfo.app === appPattern
+        })
+        if (appMatches) {
+          return true
+        }
+      }
+
+      // 检查 title 匹配（正则表达式）
+      if (windowCmd.match.title && windowInfo.title) {
+        try {
+          const titleRegexStr = windowCmd.match.title.replace(/^\/|\/[gimuy]*$/g, '')
+          const titleRegex = new RegExp(titleRegexStr)
+          if (titleRegex.test(windowInfo.title)) {
+            return true
+          }
+        } catch (error) {
+          console.error(`窗口标题正则表达式 ${windowCmd.match.title} 解析失败:`, error)
+        }
+      }
+
+      return false
+    })
+
+    // 应用特殊指令配置，过滤禁用指令
+    return result.filter((cmd) => !isCommandDisabled(cmd)).map((cmd) => applySpecialConfig(cmd))
+  }
+
+  // 在指定的指令列表中搜索（用于粘贴内容后的二次搜索）
+  // 统一使用 search 函数，只是传入不同的指令列表
+  function searchInCommands(commandList: SearchResult[], query: string): SearchResult[] {
+    if (!query || commandList.length === 0) {
+      return commandList
+    }
+
+    // 使用统一的 search 函数
+    const result = search(query, commandList)
+    return result.bestMatches
+  }
+
+  // ==================== 历史记录相关 ====================
+
+  // 获取最近使用（自动同步最新数据）
+  function getRecentCommands(limit?: number): Command[] {
+    // 同步历史记录数据，确保使用最新的路径和图标
+    const syncedHistory = history.value.map((historyItem) => {
+      // 尝试从当前列表中找到
+      const currentCommand = commands.value.find(
+        (app) =>
+          app.name === historyItem.name &&
+          app.type === historyItem.type &&
+          app.subType === historyItem.subType &&
+          app.featureCode === historyItem.featureCode
+      )
+
+      // 如果找到了最新数据，使用最新的；否则使用历史记录
+      const command = currentCommand || historyItem
+
+      // 应用特殊指令配置（统一处理）
+      return applySpecialConfig(command)
+    })
+
+    if (limit) {
+      return syncedHistory.slice(0, limit)
+    }
+    return syncedHistory
+  }
+
+  // 从历史记录中删除指定指令（通过后端 API）
+  async function removeFromHistory(
+    commandPath: string,
+    featureCode?: string,
+    name?: string
+  ): Promise<void> {
+    await window.ztools.removeFromHistory(commandPath, featureCode, name)
+    // 后端会发送 history-changed 事件，触发重新加载
+  }
+
+  // ==================== 固定应用相关 ====================
+
+  // 保存固定列表到数据库
+  async function savePinned(): Promise<void> {
+    try {
+      const cleanData = pinnedCommands.value.map((cmd) => ({
+        name: cmd.name,
+        path: cmd.path,
+        icon: cmd.icon,
+        type: cmd.type,
+        featureCode: cmd.featureCode, // 保存 featureCode
+        pluginExplain: cmd.pluginExplain // 保存插件说明
+      }))
+
+      await window.ztools.dbPut(PINNED_DOC_ID, cleanData)
+    } catch (error) {
+      console.error('保存固定列表失败:', error)
+    }
+  }
+
+  // 检查指令是否已固定（非插件类型需要同时匹配 name 和 path，支持同路径不同名应用）
+  function isPinned(commandPath: string, featureCode?: string, name?: string): boolean {
+    return pinnedCommands.value.some((cmd) => {
+      // 对于插件，需要同时匹配 path 和 featureCode
+      if (cmd.type === 'plugin' && featureCode !== undefined) {
+        return cmd.path === commandPath && cmd.featureCode === featureCode
+      }
+      // 非插件类型：同时匹配 name 和 path
+      if (name) {
+        return cmd.path === commandPath && cmd.name === name
+      }
+      return cmd.path === commandPath
+    })
+  }
+
+  // 固定指令
+  async function pinCommand(command: Command): Promise<void> {
+    // 将 Vue 响应式对象转换为纯对象，避免 IPC 传递时的克隆错误
+    const plainCommand = JSON.parse(JSON.stringify(command))
+    await window.ztools.pinApp(plainCommand)
+    // 后端会发送 pinned-changed 事件，触发重新加载
+  }
+
+  // 取消固定
+  async function unpinCommand(
+    commandPath: string,
+    featureCode?: string,
+    name?: string
+  ): Promise<void> {
+    await window.ztools.unpinApp(commandPath, featureCode, name)
+    // 后端会发送 pinned-changed 事件，触发重新加载
+  }
+
+  // 获取固定列表（自动同步最新数据）
+  function getPinnedCommands(): Command[] {
+    // 同步固定列表的数据，确保使用最新的路径和图标
+    return pinnedCommands.value.map((pinnedItem) => {
+      // 尝试从当前列表中找到
+      const currentCommand = commands.value.find(
+        (cmd) =>
+          cmd.name === pinnedItem.name &&
+          cmd.type === pinnedItem.type &&
+          cmd.subType === pinnedItem.subType &&
+          cmd.featureCode === pinnedItem.featureCode
+      )
+
+      // 如果找到了最新数据，使用最新的；否则使用固定列表中的
+      return currentCommand || pinnedItem
+    })
+  }
+
+  // 更新固定列表顺序
+  async function updatePinnedOrder(newOrder: Command[]): Promise<void> {
+    // 乐观更新：立即更新本地状态，避免等待后端导致的延迟和闪动
+    pinnedCommands.value = newOrder
+
+    // 标记这是本地触发的更新
+    isLocalPinnedUpdate = true
+
+    // 异步保存到后端，不等待完成
+    // 将 Vue 响应式对象数组转换为纯对象数组，避免 IPC 传递时的克隆错误
+    const plainOrder = JSON.parse(JSON.stringify(newOrder))
+    window.ztools.updatePinnedOrder(plainOrder).catch((error) => {
+      console.error('保存固定列表顺序失败:', error)
+      // 如果保存失败，重置标志并重新从后端加载数据
+      isLocalPinnedUpdate = false
+      loadPinnedData()
+    })
+    // 注意：不需要等待 pinned-changed 事件，因为本地已经更新了
+  }
+
+  // 清空固定列表
+  async function clearPinned(): Promise<void> {
+    pinnedCommands.value = []
+    await savePinned()
+  }
+
+  // ==================== mainPush 相关 ====================
+
+  /**
+   * 获取与搜索查询匹配的 mainPush 功能列表
+   * 根据每个 mainPush feature 的 cmds 定义检查匹配
+   */
+  function getMatchingMainPushFeatures(
+    query: string
+  ): Array<MainPushFeature & { matchedCmdType: string }> {
+    if (!query.trim()) return []
+
+    const results: Array<MainPushFeature & { matchedCmdType: string }> = []
+    const seen = new Set<string>()
+
+    for (const feature of mainPushFeatures.value) {
+      const featureKey = `${feature.pluginPath}:${feature.featureCode}`
+      if (seen.has(featureKey)) continue
+
+      let matched = false
+      let matchedCmdType = 'text'
+
+      for (const cmd of feature.cmds) {
+        if (typeof cmd === 'string') {
+          // 文本匹配：检查查询是否部分匹配 cmd 名称（使用 Fuse.js 的结果或简单包含）
+          const cmdLower = cmd.toLowerCase()
+          const queryLower = query.toLowerCase()
+          const cmdPinyin = pinyin(cmd, { toneType: 'none', type: 'string' })
+            .replace(/\s+/g, '')
+            .toLowerCase()
+          const cmdPinyinAbbr = pinyin(cmd, { pattern: 'first', toneType: 'none', type: 'string' })
+            .replace(/\s+/g, '')
+            .toLowerCase()
+
+          if (
+            cmdLower.includes(queryLower) ||
+            queryLower.includes(cmdLower) ||
+            cmdPinyin.includes(queryLower) ||
+            cmdPinyinAbbr.includes(queryLower)
+          ) {
+            matched = true
+            matchedCmdType = 'text'
+            break
+          }
+        } else if (cmd.type === 'regex') {
+          if (query.length >= (cmd.minLength || 0)) {
+            try {
+              const regexStr = cmd.match.replace(/^\/|\/[gimuy]*$/g, '')
+              if (new RegExp(regexStr).test(query)) {
+                matched = true
+                matchedCmdType = 'regex'
+                break
+              }
+            } catch {
+              /* 忽略无效正则 */
+            }
+          }
+        } else if (cmd.type === 'over') {
+          const minLen = cmd.minLength ?? 1
+          const maxLen = cmd.maxLength ?? 10000
+          if (query.length >= minLen && query.length <= maxLen) {
+            if (cmd.exclude) {
+              try {
+                const excludeStr = cmd.exclude.replace(/^\/|\/[gimuy]*$/g, '')
+                if (new RegExp(excludeStr).test(query)) continue
+              } catch {
+                /* 忽略 */
+              }
+            }
+            matched = true
+            matchedCmdType = 'over'
+            break
+          }
+        }
+      }
+
+      if (matched) {
+        seen.add(featureKey)
+        results.push({ ...feature, matchedCmdType })
+      }
+    }
+
+    return results
+  }
+
+  return {
+    // 状态
+    history,
+    pinnedCommands,
+    commands,
+    regexCommands,
+    mainPushFeatures,
+    loading,
+    isInitialized,
+
+    // 初始化
+    initializeData,
+
+    // 指令和搜索相关
+    loadCommands,
+    search,
+    searchInCommands,
+    searchImageCommands,
+    searchTextCommands,
+    searchFileCommands,
+    searchWindowCommands,
+    reloadUserData,
+    applySpecialConfig, // 导出特殊配置应用函数
+
+    // mainPush 相关
+    getMatchingMainPushFeatures,
+
+    // 指令历史记录方法（添加由后端处理）
+    getRecentCommands,
+    removeFromHistory,
+
+    // 固定指令方法
+    isPinned,
+    pinCommand,
+    unpinCommand,
+    getPinnedCommands,
+    updatePinnedOrder,
+    clearPinned,
+
+    // 超级面板固定方法
+    superPanelPinned,
+    loadSuperPanelPinnedData,
+    isPinnedToSuperPanel,
+
+    // 搜索偏好
+    saveSearchPreference
+  }
+})

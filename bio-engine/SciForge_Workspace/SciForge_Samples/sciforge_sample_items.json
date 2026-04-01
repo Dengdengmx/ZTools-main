@@ -1,0 +1,15 @@
+{
+    "equip_drawer/cont_301c1b": {
+        "F-1": {
+            "id": "SPL-F-1",
+            "name": "11",
+            "type": "🧬 质粒 (Plasmid)",
+            "vol": 100.0,
+            "unit": "μL",
+            "ft": 11,
+            "owner": "Admin",
+            "notes": "11",
+            "deposit_time": "2026-04-01 22:38:18"
+        }
+    }
+}

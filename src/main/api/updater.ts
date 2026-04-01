@@ -1,0 +1,524 @@
+import { ipcMain, app, BrowserWindow, screen } from 'electron'
+import { is } from '@electron-toolkit/utils'
+import { promises as fs } from 'fs'
+import path from 'path'
+import AdmZip from 'adm-zip'
+import { downloadFile } from '../utils/download.js'
+import { spawn } from 'child_process'
+import yaml from 'yaml'
+import databaseAPI from './shared/database.js'
+import { applyWindowMaterial, getDefaultWindowMaterial } from '../utils/windowUtils.js'
+
+/**
+ * 更新路径配置
+ */
+interface UpdatePaths {
+  updaterPath: string
+  asarSrc: string
+  asarDst: string
+  unpackedSrc: string
+  unpackedDst: string
+  appPath: string
+}
+
+/**
+ * 升级管理 API
+ */
+export class UpdaterAPI {
+  private latestYmlUrl =
+    'https://github.com/MToolsCenter/MTools/releases/latest/download/latest.yml'
+  private mainWindow: BrowserWindow | null = null
+  private checkTimer: NodeJS.Timeout | null = null
+  private downloadedUpdateInfo: any = null
+  private downloadedUpdatePath: string | null = null
+  private updateWindow: BrowserWindow | null = null
+
+  public init(mainWindow: BrowserWindow): void {
+    this.mainWindow = mainWindow
+    this.setupIPC()
+    // this.startAutoCheck()
+  }
+
+  private setupIPC(): void {
+    ipcMain.handle('updater:check-update', () => this.checkUpdate())
+    ipcMain.handle('updater:start-update', (_event, updateInfo) => this.startUpdate(updateInfo))
+    ipcMain.handle('updater:install-downloaded-update', () => this.installDownloadedUpdate())
+    ipcMain.handle('updater:get-download-status', () => this.getDownloadStatus())
+
+    // Update Window IPC
+    ipcMain.on('updater:quit-and-install', () => this.installDownloadedUpdate())
+    ipcMain.on('updater:close-window', () => this.closeUpdateWindow())
+    ipcMain.on('updater:window-ready', () => {
+      if (this.updateWindow && this.downloadedUpdateInfo) {
+        this.updateWindow.webContents.send('update-info', {
+          version: this.downloadedUpdateInfo.version,
+          changelog: this.downloadedUpdateInfo.changelog
+        })
+      }
+    })
+  }
+
+  /**
+   * 启动自动检查（30分钟一次）
+   */
+  private startAutoCheck(): void {
+    try {
+      // 获取设置
+      const settings = databaseAPI.dbGet('settings-general')
+      const autoCheck = settings?.autoCheckUpdate ?? true // 默认开启
+
+      if (!autoCheck) {
+        console.log('[Updater] 自动检查更新已禁用')
+        return
+      }
+
+      // 应用启动后立即进行首次检查
+      this.autoCheckAndDownload()
+
+      // 清除旧定时器
+      this.cleanup()
+
+      // 每30分钟检查一次
+      this.checkTimer = setInterval(() => this.autoCheckAndDownload(), 30 * 60 * 1000)
+    } catch (error) {
+      console.error('[Updater] 启动自动检查更新失败:', error)
+      // 出错时默认启动
+      this.autoCheckAndDownload()
+      this.checkTimer = setInterval(() => this.autoCheckAndDownload(), 30 * 60 * 1000)
+    }
+  }
+
+  /**
+   * 停止自动检查
+   */
+  private stopAutoCheck(): void {
+    if (this.checkTimer) {
+      clearInterval(this.checkTimer)
+      this.checkTimer = null
+      console.log('[Updater] 自动检查更新已停止')
+    }
+  }
+
+  /**
+   * 设置是否自动检查
+   */
+  public setAutoCheck(enabled: boolean): void {
+    if (enabled) {
+      this.startAutoCheck()
+    } else {
+      this.stopAutoCheck()
+    }
+  }
+
+  /**
+   * 自动检查并下载更新
+   */
+  private async autoCheckAndDownload(): Promise<void> {
+    try {
+      console.log('[Updater] 开始自动检查更新...')
+
+      // 如果已经下载过更新，不再重复下载
+      if (this.downloadedUpdateInfo) {
+        console.log('[Updater] 已有下载的更新，跳过检查')
+        return
+      }
+
+      const result = await this.checkUpdate()
+
+      if (result.hasUpdate && result.updateInfo) {
+        console.log('[Updater] 发现新版本，开始自动下载...', result.updateInfo)
+
+        // 通知渲染进程开始下载
+        this.mainWindow?.webContents.send('update-download-start', {
+          version: result.updateInfo.version
+        })
+
+        // 执行下载
+        const downloadResult = await this.downloadAndExtractUpdate(result.updateInfo)
+
+        if (downloadResult.success) {
+          this.downloadedUpdateInfo = result.updateInfo
+          this.downloadedUpdatePath = downloadResult.extractPath
+
+          // 通知渲染进程下载完成
+          this.mainWindow?.webContents.send('update-downloaded', {
+            version: result.updateInfo.version,
+            changelog: result.updateInfo.changelog
+          })
+
+          console.log('[Updater] 更新下载完成，等待用户安装')
+
+          // 弹出更新窗口
+          this.createUpdateWindow()
+        } else {
+          console.error('[Updater] 更新下载失败:', downloadResult.error)
+          this.mainWindow?.webContents.send('update-download-failed', {
+            error: downloadResult.error instanceof Error ? downloadResult.error.message : '下载失败'
+          })
+        }
+      }
+    } catch (error) {
+      console.error('[Updater] 自动检查更新失败:', error)
+    }
+  }
+
+  /**
+   * 获取下载状态
+   */
+  private getDownloadStatus(): any {
+    if (this.downloadedUpdateInfo) {
+      return {
+        hasDownloaded: true,
+        version: this.downloadedUpdateInfo.version,
+        changelog: this.downloadedUpdateInfo.changelog
+      }
+    }
+    return { hasDownloaded: false }
+  }
+
+  /**
+   * 根据平台选择下载URL
+   */
+  private selectDownloadUrl(updateInfo: any): string {
+    // 直接使用 updateInfo 中的 downloadUrl
+    return updateInfo.downloadUrl
+  }
+
+  /**
+   * 构建更新包下载 URL
+   * 格式: update-{platform}-{arch}-{version}.zip
+   * 例如: update-darwin-arm64-1.2.8.zip
+   */
+  private buildUpdateDownloadUrl(version: string): string {
+    const platform = process.platform // darwin, win32, linux
+    const arch = process.arch // x64, arm64
+
+    const fileName = `update-${platform}-${arch}-${version}.zip`
+    const baseUrl = 'https://github.com/MToolsCenter/MTools/releases/latest/download'
+
+    return `${baseUrl}/${fileName}`
+  }
+
+  /**
+   * 下载并解压更新包
+   */
+  private async downloadAndExtractUpdate(updateInfo: any): Promise<any> {
+    try {
+      // 1. 获取下载 URL（已经在 checkUpdate 中构建好了）
+      const downloadUrl = this.selectDownloadUrl(updateInfo)
+
+      console.log('[Updater] 下载更新包:', downloadUrl)
+
+      // 2. 下载更新包
+      const tempDir = path.join(app.getPath('userData'), 'ztools-update-pkg')
+      await fs.mkdir(tempDir, { recursive: true })
+      const tempZipPath = path.join(tempDir, `update-${Date.now()}.zip`)
+      const extractPath = path.join(tempDir, `extracted-${Date.now()}`)
+
+      await downloadFile(downloadUrl, tempZipPath)
+
+      // 3. 解压
+      console.log('[Updater] 解压更新包...')
+      await fs.mkdir(extractPath, { recursive: true })
+
+      const zip = new AdmZip(tempZipPath)
+      await new Promise<void>((resolve, reject) => {
+        zip.extractAllToAsync(extractPath, true, false, (error?: Error) => {
+          if (error) {
+            reject(error)
+          } else {
+            resolve()
+          }
+        })
+      })
+
+      // 4. 重命名 app.asar.tmp -> app.asar（如果存在）
+      const appAsarTmp = path.join(extractPath, 'app.asar.tmp')
+      const appAsar = path.join(extractPath, 'app.asar')
+      try {
+        await fs.access(appAsarTmp)
+        await fs.rename(appAsarTmp, appAsar)
+        console.log('[Updater] 成功重命名: app.asar.tmp -> app.asar')
+      } catch {
+        console.log('[Updater] 未找到 app.asar.tmp，可能直接是 app.asar')
+      }
+
+      // 5. 删除 zip 文件节省空间
+      try {
+        await fs.unlink(tempZipPath)
+      } catch (e) {
+        console.error('[Updater] 删除 zip 文件失败:', e)
+      }
+
+      return { success: true, extractPath }
+    } catch (error: unknown) {
+      console.error('[Updater] 下载更新失败:', error)
+      return { success: false, error: error instanceof Error ? error.message : '未知错误' }
+    }
+  }
+
+  /**
+   * 获取更新路径配置
+   */
+  private async getUpdatePaths(extractPath: string): Promise<UpdatePaths> {
+    const isMac = process.platform === 'darwin'
+    const isWin = process.platform === 'win32'
+    const appPath = process.execPath
+
+    const asarSrc = path.join(extractPath, 'app.asar')
+    const unpackedSrc = path.join(extractPath, 'app.asar.unpacked')
+
+    let updaterPath = ''
+    let asarDst = ''
+    let unpackedDst = ''
+
+    if (isMac) {
+      const contentsDir = path.dirname(path.dirname(appPath))
+      const resourcesDir = path.join(contentsDir, 'Resources')
+
+      if (!app.isPackaged) {
+        const safeArch = process.arch === 'arm64' ? 'arm64' : 'amd64'
+        updaterPath = path.join(app.getAppPath(), `updater/mac-${safeArch}/ztools-updater`)
+      } else {
+        updaterPath = path.join(path.dirname(appPath), 'ztools-updater')
+      }
+
+      asarDst = path.join(resourcesDir, 'app.asar')
+      unpackedDst = path.join(resourcesDir, 'app.asar.unpacked')
+    } else if (isWin) {
+      const appDir = path.dirname(appPath)
+      const agentPath = path.join(appDir, 'ztools-agent.exe')
+      const oldUpdaterPath = path.join(appDir, 'ztools-updater.exe')
+
+      // 兼容旧版本：如果 ztools-agent.exe 不存在，尝试查找并重命名 ztools-updater.exe
+      try {
+        await fs.access(agentPath)
+        updaterPath = agentPath
+      } catch {
+        // ztools-agent.exe 不存在，尝试查找旧版本
+        try {
+          await fs.access(oldUpdaterPath)
+          // 找到旧版本，重命名为新版本
+          await fs.rename(oldUpdaterPath, agentPath)
+          console.log('[Updater] 已将 ztools-updater.exe 重命名为 ztools-agent.exe')
+          updaterPath = agentPath
+        } catch {
+          // 两个文件都不存在，使用默认路径（后续会报错）
+          updaterPath = agentPath
+        }
+      }
+
+      const resourcesDir = path.join(appDir, 'resources')
+      asarDst = path.join(resourcesDir, 'app.asar')
+      unpackedDst = path.join(resourcesDir, 'app.asar.unpacked')
+    }
+
+    return { updaterPath, asarSrc, asarDst, unpackedSrc, unpackedDst, appPath }
+  }
+
+  /**
+   * 启动 updater 并退出应用
+   */
+  private async launchUpdater(paths: UpdatePaths): Promise<void> {
+    // 检查 updater 是否存在
+    try {
+      await fs.access(paths.updaterPath)
+    } catch {
+      throw new Error(`找不到升级程序: ${paths.updaterPath}`)
+    }
+
+    // 构建参数
+    const args = ['--asar-src', paths.asarSrc, '--asar-dst', paths.asarDst, '--app', paths.appPath]
+
+    if (paths.unpackedSrc) {
+      args.push('--unpacked-src', paths.unpackedSrc)
+      args.push('--unpacked-dst', paths.unpackedDst)
+    }
+
+    console.log('[Updater] 启动升级程序:', paths.updaterPath, args)
+
+    // 启动 updater
+    const subprocess = spawn(paths.updaterPath, args, {
+      detached: true,
+      stdio: 'ignore'
+    })
+
+    subprocess.unref()
+
+    // 退出应用
+    console.log('[Updater] 应用即将退出进行更新...')
+    app.exit(0)
+  }
+
+  /**
+   * 安装已下载的更新
+   */
+  private async installDownloadedUpdate(): Promise<any> {
+    try {
+      if (!this.downloadedUpdatePath || !this.downloadedUpdateInfo) {
+        throw new Error('没有可用的更新')
+      }
+
+      const paths = await this.getUpdatePaths(this.downloadedUpdatePath)
+      await this.launchUpdater(paths)
+
+      return { success: true }
+    } catch (error: unknown) {
+      console.error('[Updater] 安装更新失败:', error)
+      return { success: false, error: error instanceof Error ? error.message : '未知错误' }
+    }
+  }
+
+  /**
+   * 清理定时器
+   */
+  public cleanup(): void {
+    if (this.checkTimer) {
+      clearInterval(this.checkTimer)
+      this.checkTimer = null
+    }
+  }
+
+  /**
+   * 检查更新
+   */
+  private async checkUpdate(): Promise<any> {
+    console.log('[Updater] 联网更新已被强制物理切断')
+    return { hasUpdate: false }
+    
+  }
+
+  /**
+   * 开始更新（手动升级）
+   */
+  private async startUpdate(updateInfo: any): Promise<any> {
+    try {
+      console.log('[Updater] 开始更新流程...', updateInfo)
+
+      // 1. 下载并解压更新包
+      const downloadResult = await this.downloadAndExtractUpdate(updateInfo)
+      if (!downloadResult.success) {
+        return downloadResult
+      }
+
+      // 2. 获取更新路径配置
+      const paths = await this.getUpdatePaths(downloadResult.extractPath)
+
+      // 3. 启动 updater 并退出应用
+      await this.launchUpdater(paths)
+
+      return { success: true }
+    } catch (error: unknown) {
+      console.error('[Updater] 更新流程失败:', error)
+      return { success: false, error: error instanceof Error ? error.message : '未知错误' }
+    }
+  }
+
+  /**
+   * 应用窗口材质到 Update 窗口
+   */
+  private applyMaterialToUpdateWindow(win: BrowserWindow): void {
+    try {
+      const settings = databaseAPI.dbGet('settings-general')
+      const material = settings?.windowMaterial || getDefaultWindowMaterial()
+      applyWindowMaterial(win, material)
+    } catch (error) {
+      console.error('[Updater] 应用窗口材质失败:', error)
+    }
+  }
+
+  /**
+   * 创建更新窗口
+   */
+  private createUpdateWindow(): void {
+    if (this.updateWindow && !this.updateWindow.isDestroyed()) {
+      this.updateWindow.show()
+      this.updateWindow.focus()
+      return
+    }
+
+    const width = 500
+    const height = 450
+
+    // 计算窗口位置（居中）
+    const primaryDisplay = screen.getPrimaryDisplay()
+    const { workArea } = primaryDisplay
+    const x = Math.round(workArea.x + (workArea.width - width) / 2)
+    const y = Math.round(workArea.y + (workArea.height - height) / 2)
+
+    const windowConfig: Electron.BrowserWindowConstructorOptions = {
+      width,
+      height,
+      x,
+      y,
+      frame: false,
+      resizable: false,
+      maximizable: false,
+      minimizable: false,
+      alwaysOnTop: true,
+      hasShadow: true,
+      type: 'panel', // 尝试使用 panel 类型，类似 SuperPanel
+      webPreferences: {
+        preload: path.join(__dirname, '../preload/index.js'),
+        sandbox: false,
+        contextIsolation: true,
+        nodeIntegration: false
+      }
+    }
+
+    // macOS 系统配置
+    if (process.platform === 'darwin') {
+      windowConfig.transparent = true
+      windowConfig.vibrancy = 'fullscreen-ui'
+    }
+    // Windows 系统配置（不设置 transparent，让 setBackgroundMaterial 生效）
+    else if (process.platform === 'win32') {
+      windowConfig.backgroundColor = '#00000000'
+    }
+
+    this.updateWindow = new BrowserWindow(windowConfig)
+
+    if (is.dev && process.env['ELECTRON_RENDERER_URL']) {
+      this.updateWindow.loadURL(`${process.env['ELECTRON_RENDERER_URL']}/updater.html`)
+    } else {
+      this.updateWindow.loadFile(path.join(__dirname, '../renderer/updater.html'))
+    }
+
+    // 应用材质 (仅 Windows)
+    if (process.platform === 'win32') {
+      this.applyMaterialToUpdateWindow(this.updateWindow)
+    }
+
+    this.updateWindow.once('ready-to-show', () => {
+      this.updateWindow?.show()
+    })
+
+    this.updateWindow.on('closed', () => {
+      this.updateWindow = null
+    })
+  }
+
+  /**
+   * 关闭更新窗口
+   */
+  private closeUpdateWindow(): void {
+    if (this.updateWindow && !this.updateWindow.isDestroyed()) {
+      this.updateWindow.close()
+    }
+  }
+
+  private compareVersions(v1: string, v2: string): number {
+    const parts1 = v1.split('.').map(Number)
+    const parts2 = v2.split('.').map(Number)
+
+    for (let i = 0; i < Math.max(parts1.length, parts2.length); i++) {
+      const p1 = parts1[i] || 0
+      const p2 = parts2[i] || 0
+      if (p1 > p2) return 1
+      if (p1 < p2) return -1
+    }
+    return 0
+  }
+}
+
+export default new UpdaterAPI()

@@ -1,0 +1,1252 @@
+<template>
+  <div class="app-container" :class="{ 'app-container__plugin': currentView === ViewMode.Plugin }">
+    
+    <div v-if="isDashboardMode" class="mtools-dashboard fade-in">
+      <aside class="sidebar" :class="{ 'collapsed': isSidebarCollapsed }">
+        <div class="logo" @click="toggleSidebar" title="点击展开/收缩侧边栏">
+          <span class="icon">🧬</span>
+          <span class="text">Mtools</span> </div>
+        
+        <nav class="nav-menu">
+          <div class="nav-item" :class="{ active: currentDashboardTab === 'dashboard' }" @click="currentDashboardTab = 'dashboard'">
+            <span class="icon">📊</span>
+            <span class="text">全局大盘</span>
+          </div>
+          <div class="nav-item" :class="{ active: currentDashboardTab === 'eln' }" @click="currentDashboardTab = 'eln'">
+            <span class="icon">📓</span>
+            <span class="text">实验日历 (ELN)</span>
+          </div>
+          <div class="nav-item" :class="{ active: currentDashboardTab === 'sample' }" @click="currentDashboardTab = 'sample'">
+            <span class="icon">🧪</span>
+            <span class="text">样本中心</span>
+          </div>
+          <div class="nav-item" :class="{ active: currentDashboardTab === 'plugins' }" @click="currentDashboardTab = 'plugins'">
+            <span class="icon">🧬</span>
+            <span class="text">算力引擎</span>
+          </div>
+        </nav>
+        
+        <div class="bottom-tools">
+          <div class="nav-item" :class="{ 'pinned-active': isPinned }" @click="togglePin">
+            <span class="icon">{{ isPinned ? '📌' : '📍' }}</span>
+            <span class="text">{{ isPinned ? '已固定 (常驻)' : '点击固定窗口' }}</span>
+          </div>
+          <div class="nav-item" @click="toggleDashboard(false)">
+            <span class="icon">🔍</span>
+            <span class="text">返回搜索框 (Esc)</span>
+          </div>
+        </div>
+      </aside>
+      
+      <main class="workspace">
+        <div v-if="currentDashboardTab === 'dashboard'" class="welcome-card fade-in">
+          <h2>欢迎来到 Mtools 完全体！🚀</h2>
+          <p>双轨架构已打通。左侧是你的重型科研工作站，按下 Esc 即可退回极速搜索框。</p>
+          <button class="btn-primary" @click="currentDashboardTab = 'sample'">进入样本中心</button>
+        </div>
+
+        <ElnCalendar v-if="currentDashboardTab === 'eln'" class="workspace-full fade-in" />
+        <SampleHub v-if="currentDashboardTab === 'sample'" class="workspace-full fade-in" />
+        <BioPlugins v-if="currentDashboardTab === 'plugins'" class="workspace-full fade-in" />
+      </main>
+    </div>
+
+    <div v-show="!isDashboardMode" class="search-window">
+      <div :class="['search-box-wrapper', { 'with-divider': currentView === ViewMode.Plugin }]">
+        <SearchBox
+          ref="searchBoxRef"
+          v-model:pasted-image="pastedImageData"
+          v-model:pasted-files="pastedFilesData"
+          v-model:pasted-text="pastedTextData"
+          :model-value="searchQuery"
+          :current-view="currentView"
+          @update:model-value="handleSearchQueryChange"
+          @composing="handleComposing"
+          @arrow-keydown="handleArrowKeydown"
+          @close-plugin="handleClosePlugin"
+        />
+        
+        <div class="mtools-entry-btn" @click="toggleDashboard(true)" title="展开 Mtools 工作站">
+          🧬 工作站
+        </div>
+      </div>
+
+      <SearchResults
+        v-if="currentView === ViewMode.Search"
+        ref="searchResultsRef"
+        :search-query="searchQuery"
+        :pasted-image="pastedImageData"
+        :pasted-files="pastedFilesData"
+        :pasted-text="pastedTextData"
+        @height-changed="updateWindowHeight"
+        @focus-input="handleFocusInput"
+        @restore-match="handleRestoreMatch"
+      />
+
+      <div v-if="currentView === ViewMode.Plugin" class="plugin-placeholder"></div>
+    </div>
+  </div>
+</template>
+
+<script setup lang="ts">
+import { nextTick, onMounted, onUnmounted, ref, watch } from 'vue'
+import SearchBox from './components/search/SearchBox.vue'
+import SearchResults from './components/search/SearchResults.vue'
+import { useCommandDataStore } from './stores/commandDataStore'
+import { useWindowStore } from './stores/windowStore'
+import ElnCalendar from './components/ElnCalendar.vue'
+import SampleHub from './components/SampleHub.vue'
+import BioPlugins from './components/BioPlugins.vue'
+import DataHub from './components/DataHub.vue'
+// FileItem 接口（从剪贴板管理器返回的格式）
+interface FileItem {
+  path: string
+  name: string
+  isDirectory: boolean
+}
+
+enum ViewMode {
+  Search = 'search',
+  Plugin = 'plugin'
+}
+
+const windowStore = useWindowStore()
+const commandDataStore = useCommandDataStore()
+
+const searchQuery = ref('')
+const isComposing = ref(false)
+const currentView = ref<ViewMode>(ViewMode.Search)
+const searchBoxRef = ref<{ focus: () => void; selectAll: () => void } | null>(null)
+const searchResultsRef = ref<{
+  handleKeydown: (e: KeyboardEvent) => void
+  resetSelection: () => void
+  resetCollapseState: () => void
+} | null>(null)
+// 粘贴的图片数据
+const pastedImageData = ref<string | null>(null)
+// 粘贴的文件数据
+const pastedFilesData = ref<FileItem[] | null>(null)
+// 粘贴的文本数据
+const pastedTextData = ref<string | null>(null)
+
+// 🚨 新增：Mtools 工作站模式开关
+// 原有的母舰开关
+const isDashboardMode = ref(false)
+// 🚨 新增：母舰内部的标签页导航状态
+const currentDashboardTab = ref('dashboard')
+
+// 🚨 新增：控制侧边栏折叠状态
+const isSidebarCollapsed = ref(false)
+function toggleSidebar() {
+  isSidebarCollapsed.value = !isSidebarCollapsed.value
+}
+
+// 🚨 新增图钉状态与函数
+const isPinned = ref(false)
+function togglePin() {
+  isPinned.value = !isPinned.value
+  window.ztools.setWindowPinned(isPinned.value) // 发送给底层 Electron
+}
+
+function toggleDashboard(show: boolean) {
+  isDashboardMode.value = show
+  if (show) {
+    nextTick(() => { window.ztools.resizeWindow(800) })
+  } else {
+    // 🚨 用户按 Esc 退回小搜索框时，我们体贴地帮他“拔掉钉子”，恢复即用即走
+    if (isPinned.value) {
+      togglePin()
+    }
+    updateWindowHeight()
+    nextTick(() => { searchBoxRef.value?.focus() })
+  }
+}
+
+// 处理搜索框输入变化（由 SearchBox @update:model-value 触发，仅用户输入会触发）
+function handleSearchQueryChange(value: string): void {
+  searchQuery.value = value
+  // 如果在插件模式下，通知主进程，由主进程转发给插件（同时更新缓存）
+  if (currentView.value === ViewMode.Plugin && windowStore.currentPlugin) {
+    window.ztools.notifySubInputChange(value)
+  }
+}
+
+// 监听粘贴图片数据变化
+watch(pastedImageData, (newValue) => {
+  // 粘贴图片时清空其他粘贴内容（但保留搜索框文本，用于搜索指令）
+  if (newValue) {
+    pastedFilesData.value = null
+    pastedTextData.value = null
+  }
+})
+
+// 监听粘贴文件数据变化
+watch(pastedFilesData, (newValue) => {
+  // 粘贴文件时清空其他粘贴内容（但保留搜索框文本，用于搜索指令）
+  if (newValue) {
+    pastedImageData.value = null
+    pastedTextData.value = null
+  }
+})
+
+// 监听粘贴文本数据变化
+watch(pastedTextData, (newValue) => {
+  // 粘贴文本时清空其他粘贴内容（但保留搜索框文本，用于搜索指令）
+  if (newValue) {
+    pastedImageData.value = null
+    pastedFilesData.value = null
+  }
+})
+
+// 动态调整窗口高度
+function updateWindowHeight(): Promise<void> {
+  return nextTick(() => {
+    const container = document.querySelector('.app-container')
+    if (container) {
+      const height = container.scrollHeight
+      window.ztools.resizeWindow(height + 1)
+    }
+  })
+}
+
+// 聚焦输入框（由 SearchResults 组件 emit）
+function handleFocusInput(): void {
+  searchBoxRef.value?.focus()
+}
+
+// 恢复上次匹配状态
+function handleRestoreMatch(state: any): void {
+  console.log('恢复上次匹配状态:', state)
+  // 恢复输入框状态
+  searchQuery.value = state.searchQuery || ''
+  pastedImageData.value = state.pastedImage || null
+  pastedFilesData.value = state.pastedFiles || null
+  pastedTextData.value = state.pastedText || null
+  // 聚焦输入框
+  nextTick(() => {
+    searchBoxRef.value?.focus()
+  })
+}
+
+// 处理输入法组合状态
+function handleComposing(composing: boolean): void {
+  isComposing.value = composing
+}
+
+// 关闭插件，返回搜索页（胶囊标签关闭按钮）
+function handleClosePlugin(): void {
+  exitPluginToSearch()
+  nextTick(() => {
+    searchBoxRef.value?.focus()
+  })
+}
+
+/**
+ * 退出当前插件并返回搜索视图（主窗口）
+ */
+function exitPluginToSearch(): void {
+  currentView.value = ViewMode.Search
+  searchQuery.value = ''
+  window.ztools.hidePlugin()
+  console.log('[PluginExit] 已退出插件并返回搜索视图')
+}
+
+/**
+ * 处理插件模式下的分步退出逻辑：清空输入 -> 清理粘贴态 -> 退出插件
+ */
+function handlePluginStepExit(): void {
+  if (searchQuery.value.trim()) {
+    // 主窗口插件模式：优先清空子输入框并通知插件
+    searchQuery.value = ''
+    window.ztools.notifySubInputChange('')
+    return
+  }
+
+  if (pastedImageData.value || pastedFilesData.value || pastedTextData.value) {
+    // 与现有 ESC 逻辑一致：第二步清理粘贴态
+    pastedImageData.value = null
+    pastedFilesData.value = null
+    pastedTextData.value = null
+    return
+  }
+
+  // 第三步：退出插件返回搜索
+  exitPluginToSearch()
+}
+
+// 将浏览器 KeyboardEvent 转换为 Electron KeyboardInputEvent 格式
+function convertToElectronKeyboardEvent(
+  direction: 'left' | 'right' | 'up' | 'down' | 'enter',
+  type: 'keyDown' | 'keyUp' = 'keyDown'
+): {
+  type: 'keyDown' | 'keyUp'
+  keyCode: string
+} {
+  // 映射方向键和回车键的 keyCode
+  const keyCodeMap: Record<string, string> = {
+    left: 'Left',
+    right: 'Right',
+    up: 'Up',
+    down: 'Down',
+    enter: 'Return'
+  }
+
+  return {
+    type,
+    keyCode: keyCodeMap[direction]
+  }
+}
+
+// 处理方向键事件
+async function handleArrowKeydown(
+  event: KeyboardEvent,
+  direction: 'left' | 'right' | 'up' | 'down' | 'enter'
+): Promise<void> {
+  // 只在插件模式下转发方向键事件
+  if (currentView.value !== ViewMode.Plugin || !windowStore.currentPlugin) {
+    return
+  }
+
+  // 只有上下方向键阻止默认行为，左右方向键允许在搜索框中移动光标
+  if (direction === 'up' || direction === 'down') {
+    event.preventDefault()
+    event.stopPropagation()
+  }
+
+  // 转换为 Electron 格式
+  const keyDownEvent = convertToElectronKeyboardEvent(direction, 'keyDown')
+  const keyUpEvent = convertToElectronKeyboardEvent(direction, 'keyUp')
+
+  // 发送给主进程：先发送 keyDown，再发送 keyUp
+  try {
+    await window.ztools.sendInputEvent(keyDownEvent)
+    // 短暂延迟后发送 keyUp，模拟真实的按键行为
+    await new Promise((resolve) => setTimeout(resolve, 10))
+    await window.ztools.sendInputEvent(keyUpEvent)
+  } catch (error) {
+    console.error('发送方向键事件失败:', error)
+  }
+}
+
+// 启动 Tab 键目标指令
+function launchTabTarget(target: string, text: string): void {
+  const commands = [...commandDataStore.regexCommands, ...commandDataStore.commands]
+  let matchedCommand: (typeof commands)[number] | null = null
+
+  const parts = target.split('/')
+  if (parts.length === 2) {
+    // 格式: 插件名称/指令名称
+    const [pluginDesc, cmdName] = parts
+    matchedCommand =
+      commands.find(
+        (c) =>
+          c.type === 'plugin' &&
+          (c.pluginName === pluginDesc || c.pluginTitle === pluginDesc) &&
+          c.name === cmdName
+      ) || null
+  } else {
+    // 格式: 指令名称（在所有指令中搜索）
+    matchedCommand = commands.find((c) => c.name === target) || null
+  }
+
+  if (!matchedCommand) {
+    console.warn('[Tab Target] 未找到目标指令:', target)
+    new Notification('MTools', {
+      body: `未找到 Tab 键目标指令「${target}」，请检查设置中的指令名称是否正确`
+    })
+    return
+  }
+
+  console.log('[Tab Target] 启动目标指令:', matchedCommand.name, '携带文本:', text)
+  window.ztools.launch({
+    path: matchedCommand.path,
+    type: matchedCommand.type as 'plugin' | 'direct',
+    featureCode: matchedCommand.featureCode,
+    name: matchedCommand.name,
+    cmdType: matchedCommand.cmdType || 'text',
+    param: {
+      payload: text,
+      type: matchedCommand.cmdType || 'text'
+    }
+  })
+}
+
+// 分离当前插件到独立窗口
+async function detachCurrentPlugin(): Promise<void> {
+  try {
+    const result = await window.ztools.detachPlugin()
+    if (!result.success) {
+      console.error('分离插件失败:', result.error)
+    }
+  } catch (error: any) {
+    console.error('分离插件失败:', error)
+  }
+}
+
+// 应用亚克力背景色叠加效果
+function applyAcrylicOverlay(): void {
+  // 移除旧的样式
+  const existingStyle = document.getElementById('acrylic-overlay-style')
+  if (existingStyle) {
+    existingStyle.remove()
+  }
+
+  // 获取当前窗口材质
+  const material = document.documentElement.getAttribute('data-material')
+
+  // 只在亚克力材质时添加样式
+  if (material === 'acrylic') {
+    const style = document.createElement('style')
+    style.id = 'acrylic-overlay-style'
+    style.textContent = `
+      body::after {
+        content: "";
+        position: fixed;
+        inset: 0;
+        pointer-events: none;
+        z-index: -1;
+      }
+
+      /* 明亮模式 */
+      @media (prefers-color-scheme: light) {
+        body::after {
+          background: rgb(255 255 255 / ${windowStore.acrylicLightOpacity}%);
+        }
+      }
+
+      /* 暗黑模式 */
+      @media (prefers-color-scheme: dark) {
+        body::after {
+          background: rgb(0 0 0 / ${windowStore.acrylicDarkOpacity}%);
+        }
+      }
+    `
+    document.head.appendChild(style)
+  }
+}
+
+// 监听视图变化，调整窗口高度
+watch(currentView, (newView) => {
+  if (newView === ViewMode.Plugin) {
+    return
+  }
+
+  updateWindowHeight()
+})
+
+//键盘操作
+async function handleKeydown(event: KeyboardEvent): Promise<void> {
+  // 如果正在输入法组合中,忽略所有键盘事件
+  if (isComposing.value) {
+    return
+  }
+
+  // Cmd/Ctrl + D: 分离插件到独立窗口
+  if ((event.key === 'd' || event.key === 'D') && (event.metaKey || event.ctrlKey)) {
+    console.log('检测到 Cmd+D 快捷键，当前视图:', currentView.value)
+    event.preventDefault()
+    if (currentView.value === ViewMode.Plugin && windowStore.currentPlugin) {
+      console.log('正在分离插件...')
+      detachCurrentPlugin()
+    }
+    return
+  }
+
+  // Cmd/Ctrl + Q: 在插件内终止插件
+  if ((event.key === 'q' || event.key === 'Q') && (event.metaKey || event.ctrlKey)) {
+    const settings = (await window.ztools.dbGet('settings-general')) || {}
+    const isEnabled = settings?.builtinAppShortcutsEnabled?.killPlugin !== false
+    if (!isEnabled) {
+      return
+    }
+    console.log('检测到 Cmd+Q/Ctrl+Q 快捷键，当前视图:', currentView.value)
+    event.preventDefault()
+    if (currentView.value === ViewMode.Plugin && windowStore.currentPlugin) {
+      // 终止插件并返回搜索页面（与右上角菜单"结束运行"相同）
+      console.log('终止插件并返回搜索页面')
+      try {
+        const result = await window.ztools.killPluginAndReturn(windowStore.currentPlugin.path)
+        if (!result.success) {
+          console.error('终止插件失败:', result.error)
+        }
+      } catch (error: any) {
+        console.error('终止插件失败:', error)
+      }
+    } else {
+      window.ztools.hideWindow()
+    }
+    return
+  }
+
+  // Tab 键：如果配置了目标指令，则启动该指令
+  if (event.key === 'Tab') {
+    const target = windowStore.tabTargetCommand
+    if (target && currentView.value === ViewMode.Search) {
+      event.preventDefault()
+      launchTabTarget(target, searchQuery.value)
+      return
+    }
+  }
+
+  // 是否为不带修饰键的裸 Backspace
+  const isPlainBackspace =
+    event.key === 'Backspace' &&
+    !event.metaKey &&
+    !event.ctrlKey &&
+    !event.altKey &&
+    !event.shiftKey
+
+  // 事件目标是否为主窗口搜索输入框（子输入框）
+  const isSearchInputTarget =
+    event.target instanceof HTMLInputElement && event.target.classList.contains('search-input')
+
+  if (
+    isPlainBackspace &&
+    currentView.value === ViewMode.Plugin &&
+    windowStore.subInputVisible &&
+    isSearchInputTarget &&
+    !searchQuery.value.trim()
+  ) {
+    // SearchBox 可能已拦截 Backspace（如清理粘贴态），避免重复处理
+    if (event.defaultPrevented) {
+      console.log('[PluginExit] Backspace 跳过处理：事件已被其他逻辑消费')
+      return
+    }
+
+    event.preventDefault()
+    console.log('[PluginExit] Backspace 命中条件：空输入 Backspace，进入分步退出逻辑')
+    handlePluginStepExit()
+    return
+  }
+
+  /// Escape 键特殊处理
+  if (event.key === 'Escape') {
+    event.preventDefault()
+
+    // 🚨 新增拦截：如果展开了母舰，按 Esc 优先缩回搜索框，而不是直接关闭软件
+    if (isDashboardMode.value) {
+      toggleDashboard(false)
+      return
+    }
+
+    if (currentView.value === ViewMode.Plugin) {
+      console.log('[PluginExit] ESC 触发分步退出逻辑')
+      handlePluginStepExit()
+      return
+    }
+
+    // 搜索页面 - 分步清除
+    if (searchQuery.value.trim()) {
+      // 第一步：清除输入框
+      searchQuery.value = ''
+    } else if (pastedImageData.value || pastedFilesData.value || pastedTextData.value) {
+      // 第二步：清除粘贴内容
+      pastedImageData.value = null
+      pastedFilesData.value = null
+      pastedTextData.value = null
+    } else {
+      // 第三步：关闭窗口
+      window.ztools.hideWindow()
+    }
+    return
+  }
+
+  // 如果不在搜索页面,不处理键盘导航
+  if (currentView.value !== ViewMode.Search) {
+    return
+  }
+
+  // 其他键盘事件委托给 SearchResults 组件处理
+  searchResultsRef.value?.handleKeydown(event)
+}
+
+// 初始化
+onMounted(async () => {
+  // 从 store 加载设置和应用数据
+  await Promise.all([
+    windowStore.loadSettings(),
+    commandDataStore.initializeData() // 初始化应用历史记录和固定列表
+  ])
+
+  // 初始调整窗口高度
+  updateWindowHeight()
+
+  console.log('监听聚焦事件')
+
+  // 监听窗口显示事件,聚焦搜索框，并接收窗口信息
+  window.ztools.onFocusSearch(async (windowInfo) => {
+    console.log('窗口聚焦事件:', windowInfo)
+    // 更新窗口信息
+    if (windowInfo) {
+      windowStore.updateWindowInfo(windowInfo)
+    }
+
+    if (currentView.value === ViewMode.Plugin) {
+      return
+    }
+
+    // 根据自动清空配置决定是否清空搜索框（会自动记录时间）
+    const shouldClear = windowStore.shouldClearSearch()
+
+    if (shouldClear) {
+      searchQuery.value = ''
+      pastedImageData.value = null // 清除粘贴的图片
+      pastedFilesData.value = null // 清除粘贴的文件
+      pastedTextData.value = null // 清除粘贴的文本
+    }
+
+    searchResultsRef.value?.resetSelection()
+    // 重置所有列表的折叠状态
+    searchResultsRef.value?.resetCollapseState()
+
+    // 聚焦输入框
+    nextTick(() => {
+      searchBoxRef.value?.focus()
+      // 如果没有清空搜索框，选中所有文本，方便用户直接输入覆盖
+      if (!shouldClear && searchQuery.value) {
+        searchBoxRef.value?.selectAll()
+      }
+    })
+
+    // 检查是否需要自动粘贴
+    const timeLimit = windowStore.getAutoPasteTimeLimit()
+    if (timeLimit > 0) {
+      try {
+        const copiedContent = await window.ztools.getLastCopiedContent(timeLimit)
+        if (copiedContent) {
+          if (copiedContent.type === 'image') {
+            // 自动粘贴图片
+            pastedImageData.value = copiedContent.data as string
+            console.log('自动粘贴图片')
+          } else if (copiedContent.type === 'text') {
+            // 自动粘贴文本到粘贴文本区域
+            pastedTextData.value = copiedContent.data as string
+            console.log('自动粘贴文本:', copiedContent.data)
+          } else if (copiedContent.type === 'file') {
+            // 自动粘贴文件
+            pastedFilesData.value = copiedContent.data as FileItem[]
+            console.log('自动粘贴文件:', copiedContent.data)
+          }
+        }
+      } catch (error) {
+        console.error('自动粘贴失败:', error)
+      }
+    }
+
+    updateWindowHeight()
+  })
+
+  // 监听插件按 ESC 返回搜索页面事件
+  console.log('监听返回搜索页面事件')
+  window.ztools.onBackToSearch(() => {
+    console.log('收到返回搜索页面事件')
+    // 切换到搜索视图
+    currentView.value = ViewMode.Search
+    // 清空搜索框
+    searchQuery.value = ''
+    // 清空当前插件信息
+    windowStore.updateCurrentPlugin(null)
+    windowStore.setPluginLoading(false)
+    // 等待 DOM 更新后调整窗口高度并聚焦搜索框
+    nextTick(() => {
+      updateWindowHeight()
+      searchBoxRef.value?.focus()
+    })
+  })
+
+  // 监听插件打开事件
+  window.ztools.onPluginOpened((plugin) => {
+    console.log('插件已打开:', plugin)
+    windowStore.updateCurrentPlugin(plugin)
+    // 清除所有粘贴内容
+    pastedImageData.value = null
+    pastedFilesData.value = null
+    pastedTextData.value = null
+  })
+
+  // 监听插件加载完成事件
+  window.ztools.onPluginLoaded((plugin) => {
+    console.log('插件页面加载完成:', plugin)
+    windowStore.setPluginLoading(false)
+  })
+
+  // 监听插件关闭事件
+  window.ztools.onPluginClosed(() => {
+    console.log('插件已关闭')
+    windowStore.updateCurrentPlugin(null)
+    windowStore.setPluginLoading(false)
+  })
+
+  // 监听子输入框 placeholder 更新事件
+  console.log(
+    'onUpdateSubInputPlaceholder 方法存在?',
+    typeof window.ztools.onUpdateSubInputPlaceholder
+  )
+  window.ztools.onUpdateSubInputPlaceholder?.(
+    (data: { pluginPath: string; placeholder: string }) => {
+      console.log('收到更新子输入框 placeholder 事件:', data)
+      windowStore.updateSubInputPlaceholder(data.placeholder)
+    }
+  )
+
+  // 监听子输入框可见性更新事件（插件调用 removeSubInput 时触发）
+  window.ztools.onUpdateSubInputVisible?.((visible: boolean) => {
+    console.log('收到更新子输入框可见性事件:', visible)
+    windowStore.updateSubInputVisible(visible)
+  })
+
+  // 监听设置子输入框值事件
+  window.ztools.onSetSubInputValue((text: string) => {
+    console.log('收到设置子输入框值事件:', text)
+    searchQuery.value = text
+  })
+
+  // 监听聚焦子输入框事件
+  window.ztools.onFocusSubInput(() => {
+    console.log('收到聚焦子输入框事件')
+    nextTick(() => {
+      searchBoxRef.value?.focus()
+    })
+  })
+
+  // 监听选中子输入框内容事件
+  window.ztools.onSelectSubInput(() => {
+    nextTick(() => {
+      searchBoxRef.value?.focus()
+      searchBoxRef.value?.selectAll()
+    })
+  })
+
+  // 监听 HTTP API 设置搜索文本事件
+  window.ztools.onSetSearchText((text: string) => {
+    searchQuery.value = text
+    nextTick(() => {
+      searchBoxRef.value?.focus()
+    })
+  })
+
+  // 监听显示插件占位区域事件（插件启动前）
+  window.ztools.onShowPluginPlaceholder(() => {
+    console.log('显示插件占位区域')
+    currentView.value = ViewMode.Plugin
+    // 清空搜索框和所有粘贴内容
+    searchQuery.value = ''
+    pastedImageData.value = null
+    pastedFilesData.value = null
+    pastedTextData.value = null
+  })
+
+  // 监听搜索框提示文字更新事件
+  window.ztools.onUpdatePlaceholder((placeholder: string) => {
+    console.log('更新搜索框提示文字:', placeholder)
+    windowStore.updatePlaceholder(placeholder)
+  })
+
+  // 监听头像更新事件
+  window.ztools.onUpdateAvatar((avatar: string) => {
+    console.log('更新头像:', avatar)
+    windowStore.updateAvatar(avatar)
+  })
+
+  // 监听自动粘贴配置更新事件
+  window.ztools.onUpdateAutoPaste((autoPaste: string) => {
+    console.log('更新自动粘贴配置:', autoPaste)
+    windowStore.updateAutoPaste(autoPaste as any)
+  })
+
+  // 监听自动清空配置更新事件
+  window.ztools.onUpdateAutoClear((autoClear: string) => {
+    console.log('更新自动清空配置:', autoClear)
+    windowStore.updateAutoClear(autoClear as any)
+  })
+
+  // 监听显示最近使用配置更新事件
+  window.ztools.onUpdateShowRecentInSearch((showRecentInSearch: boolean) => {
+    windowStore.updateShowRecentInSearch(showRecentInSearch)
+  })
+
+  // 监听匹配推荐配置更新事件
+  window.ztools.onUpdateMatchRecommendation((showMatchRecommendation: boolean) => {
+    windowStore.updateShowMatchRecommendation(showMatchRecommendation)
+  })
+
+  // 监听最近使用行数更新事件
+  window.ztools.onUpdateRecentRows((rows: number) => {
+    windowStore.updateRecentRows(rows)
+  })
+
+  // 监听固定栏行数更新事件
+  window.ztools.onUpdatePinnedRows((rows: number) => {
+    windowStore.updatePinnedRows(rows)
+  })
+
+  // 监听 Tab 键目标指令更新事件
+  window.ztools.onUpdateTabTarget((target: string) => {
+    console.log('更新 Tab 键目标指令:', target)
+    windowStore.updateTabTargetCommand(target)
+  })
+
+  // 监听空格打开指令配置更新事件
+  window.ztools.onUpdateSpaceOpenCommand((enabled: boolean) => {
+    console.log('更新空格打开指令:', enabled)
+    windowStore.updateSpaceOpenCommand(enabled)
+  })
+
+  // 监听悬浮球双击目标指令更新事件
+  window.ztools.onUpdateFloatingBallDoubleClickCommand?.((command: string) => {
+    console.log('更新悬浮球双击目标指令:', command)
+    windowStore.updateFloatingBallDoubleClickCommand(command)
+  })
+
+  // 监听搜索框模式更新事件
+  window.ztools.onUpdateSearchMode((mode: string) => {
+    windowStore.updateSearchMode(mode as 'aggregate' | 'list')
+  })
+
+  // 监听主题色更新事件
+  window.ztools.onUpdatePrimaryColor((data: { primaryColor: string; customColor?: string }) => {
+    console.log('更新主题色:', data)
+    // 更新 store（会自动处理 DOM class 和 CSS 变量）
+    windowStore.updatePrimaryColor(data.primaryColor as any)
+    if (data.customColor) {
+      windowStore.updateCustomColor(data.customColor)
+    }
+  })
+
+  // 初始化时获取当前窗口材质
+  if (window.ztools.getWindowMaterial) {
+    window.ztools.getWindowMaterial().then((material) => {
+      console.log('主渲染进程初始化材质:', material)
+      document.documentElement.setAttribute('data-material', material)
+      // 应用亚克力背景色叠加效果
+      applyAcrylicOverlay()
+    })
+  }
+
+  // 监听窗口材质更新事件
+  window.ztools.onUpdateWindowMaterial?.((material: 'mica' | 'acrylic' | 'none') => {
+    console.log('更新窗口材质:', material)
+    document.documentElement.setAttribute('data-material', material)
+    // 应用亚克力背景色叠加效果
+    applyAcrylicOverlay()
+  })
+
+  // 监听亚克力透明度更新事件
+  window.ztools.onUpdateAcrylicOpacity?.((data: { lightOpacity: number; darkOpacity: number }) => {
+    console.log('更新亚克力透明度:', data)
+    windowStore.updateAcrylicLightOpacity(data.lightOpacity)
+    windowStore.updateAcrylicDarkOpacity(data.darkOpacity)
+    // 应用亚克力背景色叠加效果
+    applyAcrylicOverlay()
+  })
+
+  // 监听应用启动事件（应用启动后）
+  window.ztools.onAppLaunched(() => {
+    console.log('应用已启动')
+    // 清空搜索框和所有粘贴内容
+    searchQuery.value = ''
+    pastedImageData.value = null
+    pastedFilesData.value = null
+    pastedTextData.value = null
+    currentView.value = ViewMode.Search
+  })
+
+  // 监听全局快捷键触发的启动事件
+  window.ztools.onIpcLaunch((options) => {
+    console.log('收到 IPC 启动事件:', options)
+
+    // 转换旧的 'app' 类型为新的 'direct' 类型
+    const launchOptions: any = {
+      ...options,
+      type: options.type === 'app' ? ('direct' as const) : options.type
+    }
+
+    // 如果是插件类型，且没有传递 param.payload，则使用当前搜索框内容
+    if (options.type === 'plugin' && (!options.param || !options.param.payload)) {
+      console.log('[IPC Launch] 使用当前搜索框内容作为 payload:', searchQuery.value)
+      launchOptions.param = {
+        ...options.param,
+        payload: searchQuery.value,
+        type: options.cmdType || 'text',
+        inputState: {
+          searchQuery: searchQuery.value,
+          pastedImage: pastedImageData.value,
+          pastedFiles: pastedFilesData.value
+        }
+      }
+    }
+
+    window.ztools.launch(launchOptions)
+  })
+
+  // 监听悬浮球文件拖放事件
+  window.ztools.onFloatingBallFiles((files) => {
+    console.log('收到悬浮球文件拖放:', files)
+    // 切换到搜索视图
+    currentView.value = ViewMode.Search
+    // 设置粘贴文件数据（效果等同于复制文件后粘贴）
+    pastedFilesData.value = files
+    // 聚焦搜索框
+    nextTick(() => {
+      searchBoxRef.value?.focus()
+    })
+    updateWindowHeight()
+  })
+
+  // 监听悬浮球双击事件
+  window.ztools.onFloatingBallDoubleClickCommand?.((command: string) => {
+    console.log('收到悬浮球双击事件，目标指令:', command)
+    if (!command) return
+
+    // 切换到搜索视图
+    currentView.value = ViewMode.Search
+    // 直接启动目标指令（不填充搜索框）
+    nextTick(() => {
+      launchTabTarget(command, '')
+    })
+  })
+
+  // 监听插件重定向搜索事件
+  window.ztools.onRedirectSearch((data) => {
+    console.log('收到重定向搜索事件:', data)
+    // 切换到搜索视图
+    currentView.value = ViewMode.Search
+    // 设置搜索内容
+    searchQuery.value = data.cmdName
+    // 聚焦搜索框
+    nextTick(() => {
+      searchBoxRef.value?.focus()
+    })
+  })
+
+  // 监听插件变化事件（安装或删除插件后刷新指令列表）
+  window.ztools.onPluginsChanged(async () => {
+    console.log('插件列表已变化，重新加载指令列表和用户数据')
+    // 先刷新指令列表，再刷新历史/固定（历史过滤依赖最新的指令列表）
+    await commandDataStore.loadCommands()
+    await commandDataStore.reloadUserData()
+  })
+
+  // 监听更新下载完成事件
+  window.ztools.onUpdateDownloaded((data) => {
+    console.log('更新已下载:', data)
+    windowStore.setUpdateDownloadInfo({
+      hasDownloaded: true,
+      version: data.version,
+      changelog: data.changelog
+    })
+  })
+
+  // 监听更新下载开始事件
+  window.ztools.onUpdateDownloadStart((data) => {
+    console.log('开始下载更新:', data)
+  })
+
+  // 监听更新下载失败事件
+  window.ztools.onUpdateDownloadFailed((data) => {
+    console.error('更新下载失败:', data)
+  })
+
+  // 检查是否有已下载的更新
+  windowStore.checkDownloadedUpdate()
+
+  // 监听超级面板搜索请求（主进程转发，携带剪贴板内容）
+  window.ztools.onSuperPanelSearch((data: { text: string; clipboardContent?: any }) => {
+    console.log(
+      '[超级面板搜索] 收到搜索请求:',
+      data.text?.substring(0, 50),
+      'clipboardType:',
+      data.clipboardContent?.type
+    )
+    const searchText = data.text || ''
+    const cc = data.clipboardContent
+
+    const seen = new Set<string>()
+    const results: any[] = []
+    const addResults = (items: any[]): void => {
+      for (const item of items) {
+        const key = `${item.path}:${item.featureCode || ''}`
+        if (!seen.has(key)) {
+          seen.add(key)
+          results.push(item)
+        }
+      }
+    }
+
+    if (cc?.type === 'image') {
+      // 图片：搜索支持 img 类型的指令
+      addResults(commandDataStore.searchImageCommands())
+    } else if (cc?.type === 'file' && cc.files) {
+      // 文件：搜索支持 files 类型的指令
+      addResults(commandDataStore.searchFileCommands(cc.files))
+    } else if (cc?.type === 'text' && cc.text) {
+      // 文本：搜索 text 和 regex/over 类型的指令
+      const { bestMatches, regexMatches } = commandDataStore.search(cc.text)
+      addResults(bestMatches)
+      addResults(regexMatches)
+    } else if (searchText) {
+      // 普通文本搜索
+      const { bestMatches, regexMatches } = commandDataStore.search(searchText)
+      addResults(bestMatches)
+      addResults(regexMatches)
+    }
+
+    console.log('[超级面板搜索] 返回结果数:', results.length)
+    // 发送搜索结果回超级面板（携带剪贴板内容）
+    window.ztools.sendSuperPanelSearchResult({
+      results: JSON.parse(JSON.stringify(results)),
+      clipboardContent: cc
+    })
+  })
+
+  // 监听超级面板窗口匹配搜索请求
+  window.ztools.onSuperPanelSearchWindowCommands((windowInfo: { app?: string; title?: string }) => {
+    const results = commandDataStore.searchWindowCommands(windowInfo)
+    window.ztools.sendSuperPanelWindowCommandsResult({
+      results: JSON.parse(JSON.stringify(results))
+    })
+  })
+
+  // 监听超级面板启动事件（由主进程从超级面板转发）
+  window.ztools.onSuperPanelLaunch(
+    async (data: { command: any; clipboardContent?: any; windowInfo?: any }) => {
+      console.log(
+        '[超级面板启动] 收到启动事件:',
+        data.command?.name,
+        'clipboardType:',
+        data.clipboardContent?.type
+      )
+      const cmd = data.command
+      const cc = data.clipboardContent
+
+      // 构造 payload（复用 SearchResults 中 handleSelectApp 的逻辑）
+      let payload: any = ''
+      let type = cmd.cmdType || 'text'
+
+      if (cmd.cmdType === 'window' && data.windowInfo) {
+        // 窗口匹配指令：payload 为窗口信息
+        payload = data.windowInfo
+      } else if (cc) {
+        if (cc.type === 'text' && cc.text) {
+          if (cmd.cmdType === 'over' || cmd.cmdType === 'regex') {
+            payload = cc.text
+          } else {
+            payload = cc.text
+          }
+        } else if (cc.type === 'image' && cc.image) {
+          payload = cc.image
+          type = 'img'
+        } else if (cc.type === 'file' && cc.files) {
+          payload = cc.files.map((file: any) => ({
+            isFile: !file.isDirectory,
+            isDirectory: file.isDirectory,
+            name: file.name,
+            path: file.path
+          }))
+          type = 'files'
+        }
+      }
+
+      try {
+        await window.ztools.launch({
+          path: cmd.path,
+          type: cmd.type || 'plugin',
+          featureCode: cmd.featureCode,
+          name: cmd.name,
+          cmdType: cmd.cmdType || type,
+          param: {
+            payload,
+            type,
+            inputState: {
+              searchQuery: cc?.type === 'text' ? cc.text || '' : '',
+              pastedImage: cc?.type === 'image' ? cc.image : null,
+              pastedFiles:
+                cc?.type === 'file'
+                  ? cc.files.map((file: any) => ({
+                      isFile: !file.isDirectory,
+                      isDirectory: file.isDirectory,
+                      name: file.name,
+                      path: file.path
+                    }))
+                  : null,
+              pastedText: cc?.type === 'text' ? cc.text : null
+            }
+          }
+        })
+      } catch (error) {
+        console.error('[超级面板启动] 启动失败:', error)
+      }
+    }
+  )
+
+  // 全局键盘事件监听
+  window.addEventListener('keydown', handleKeydown)
+})
+
+// 清理
+onUnmounted(() => {
+  window.removeEventListener('keydown', handleKeydown)
+})
+</script>
+
+<style scoped>
+.pinned-active {
+  color: #a6e3a1 !important; /* 护眼极客绿 */
+  font-weight: bold;
+  background: rgba(166, 227, 161, 0.1) !important;
+}
+.app-container {
+  width: 100%;
+  display: flex;
+  flex-direction: column;
+  outline: none;
+  overflow: hidden; /* 隐藏所有滚动条 */
+  border-radius: 8px; /* Windows 11 圆角 */
+}
+.app-container__plugin {
+  border-radius: 0;
+}
+.search-window {
+  width: 100%;
+  height: 100%;
+  display: flex;
+  flex-direction: column;
+  /* overflow: hidden; 隐藏所有滚动条 */
+  /* border-radius: 8px; Windows 11 圆角 */
+}
+
+.search-box-wrapper {
+  flex-shrink: 0;
+}
+
+.plugin-placeholder {
+  flex: 1;
+  /* min-height: 500px; */
+  background: transparent; /* 透明背景，让下方的 BrowserView 和 Mica 材质显示 */
+  -webkit-app-region: no-drag; /* 禁止拖动窗口 */
+  user-select: none; /* 禁止选取文本 */
+}
+
+/* 🚨 Mtools 专属样式追加 */
+.mtools-entry-btn {
+  position: absolute;
+  right: 65px;
+  top: 14px;
+  background: #181825;
+  border: 1px solid #313244;
+  color: #89b4fa;
+  padding: 6px 12px;
+  border-radius: 6px;
+  cursor: pointer;
+  font-weight: bold;
+  z-index: 100;
+  transition: all 0.2s ease;
+  font-size: 13px;
+  box-shadow: 0 2px 5px rgba(0,0,0,0.2);
+}
+.mtools-entry-btn:hover {
+  background: #89b4fa;
+  color: #11111b;
+  transform: translateY(-1px);
+}
+
+.mtools-dashboard {
+  display: flex;
+  height: 100vh; /* <-- 从 650px 改为 100vh */
+  background: #11111b;
+  color: #cdd6f4;
+  border-radius: 8px;
+  overflow: hidden;
+}
+.sidebar { 
+  width: 200px; 
+  background: #181825; 
+  border-right: 1px solid #313244; 
+  display: flex; 
+  flex-direction: column; 
+  padding: 20px 0; 
+  -webkit-app-region: drag; 
+  transition: width 0.3s cubic-bezier(0.4, 0, 0.2, 1); /* 平滑折叠的核心 */
+  overflow: hidden;
+  white-space: nowrap; /* 核心：防止宽度收缩时文字被挤压换行 */
+}
+.sidebar.collapsed {
+  width: 68px;
+}
+.logo { 
+  display: flex;
+  align-items: center;
+  height: 56px; /* 增加固定高度 */
+  /* 这里的 20px 就是左右间距。
+     如果你想让图标更靠左，可以改成 10px 或 15px */
+  padding: 0 10px; 
+  font-size: 20px; 
+  font-weight: 800; 
+  color: #89b4fa; 
+  border-bottom: 1px solid #313244; 
+  margin-bottom: 10px; 
+  cursor: pointer; 
+  -webkit-app-region: no-drag; 
+}
+.logo .icon,
+.nav-menu { flex: 1; padding: 0 10px; display: flex; flex-direction: column; gap: 5px; }
+.nav-item { 
+  display: flex;
+  align-items: center;
+  height: 44px; /* 增加固定高度，防止任何内容变化引起的高度坍塌 */
+  padding: 0 11px; 
+  border-radius: 6px; 
+  cursor: pointer; 
+  color: #a6adc8; 
+  transition: background 0.2s, color 0.2s; 
+  -webkit-app-region: no-drag; 
+}
+.nav-item:hover { background: #313244; color: #cdd6f4; }
+.nav-item.active { background: rgba(137, 180, 250, 0.15); color: #89b4fa; font-weight: bold; }
+.nav-item .icon {
+  display: inline-block;
+  min-width: 24px;
+  text-align: center;
+  font-size: 16px;
+  margin-right: 12px;
+  flex-shrink: 0; /* 防止图标被挤压 */
+}
+
+.sidebar .text {
+  opacity: 1;
+  transition: opacity 0.2s ease; /* 文字消失速度稍快于侧边栏折叠速度，效果更好 */
+  white-space: nowrap;
+}
+
+/* 收缩状态下，文字变成完全透明 */
+.sidebar.collapsed .text {
+  opacity: 0;
+  pointer-events: none;
+}
+
+.bottom-tools { padding: 10px; border-top: 1px solid #313244; -webkit-app-region: no-drag; }
+/* 修改原有的 .workspace */
+.workspace { 
+  flex: 1; 
+  padding: 20px; /* 🚨 将 padding 从 40px 改小一点，给组件留出空间 */
+  background: #1e1e2e; 
+  display: flex; 
+  /* 🚨 删除了 align-items: center; 和 justify-content: center; 以免组件被强行居中 */
+  overflow: hidden; /* 防止内部滚动条溢出 */
+  -webkit-app-region: drag; 
+}
+
+/* 新增的占满样式 */
+.workspace-full {
+  width: 100%;
+  height: 100%;
+  -webkit-app-region: no-drag; /* 🚨 极其重要：组件内部（如表格、按钮）必须取消拖拽，否则无法点击！ */
+}
+.welcome-card { background: #181825; padding: 40px; border-radius: 12px; text-align: center; border: 1px solid #313244; -webkit-app-region: no-drag; }
+.welcome-card h2 { color: #f5e0dc; margin-top: 0; }
+.btn-primary { background: #89b4fa; color: #11111b; border: none; padding: 10px 20px; border-radius: 6px; font-weight: bold; cursor: pointer; margin-top: 20px; transition: 0.2s; }
+.btn-primary:hover { background: #b4befe; }
+.fade-in { animation: fadeIn 0.2s ease-out; }
+@keyframes fadeIn { from { opacity: 0; transform: scale(0.98); } to { opacity: 1; transform: scale(1); } }
+
+</style>

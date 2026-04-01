@@ -1,0 +1,15 @@
+{
+    "samples": [
+        {
+            "name": "11",
+            "type": "🧬 质粒 (Plasmid)",
+            "location_str": "常温抽屉 / 储藏柜 > 新建容器 46 [孔位: F-1]",
+            "vol": 100.0,
+            "unit": "μL",
+            "ft_count": 11,
+            "owner": "Admin",
+            "notes": "11",
+            "deposit_time": "2026-04-01 22:38:18"
+        }
+    ]
+}
