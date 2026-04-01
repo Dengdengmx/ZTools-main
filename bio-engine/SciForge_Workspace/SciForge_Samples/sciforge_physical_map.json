@@ -12,7 +12,7 @@
                     "name": "新建容器 46",
                     "type": "freeform",
                     "r": 0,
-                    "c": 0,
+                    "c": 1,
                     "rs": 1,
                     "cs": 3,
                     "id": "cont_301c1b"
@@ -47,17 +47,7 @@
             "cols": 6,
             "desc": "核心资产区。用于长期冻存甘油菌、质粒、细胞株、珍贵蛋白样本等。",
             "icon": "snowflake",
-            "containers": {
-                "cont_9fb47d": {
-                    "name": "新建容器 9",
-                    "type": "10x10",
-                    "r": 0,
-                    "c": 0,
-                    "rs": 1,
-                    "cs": 1,
-                    "id": "cont_9fb47d"
-                }
-            },
+            "containers": {},
             "inner_boxes": {}
         }
     },
