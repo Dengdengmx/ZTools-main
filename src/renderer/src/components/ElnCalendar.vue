@@ -61,50 +61,62 @@
               placeholder="无标题实验记录..."
             />
             <div class="editor-tools">
-              <span style="font-size: 12px; color: #a6adc8; margin-right: 15px;">
-                💡 提示: 在正文中输入 <b>@</b> 可直接检索并绑定物理样本
-              </span>
+              <button class="btn-toggle" :class="{ 'active': isSplitView }" @click="isSplitView = !isSplitView">
+                {{ isSplitView ? '📖 关闭双屏' : '📖 开启双屏渲染' }}
+              </button>
               <button class="btn-primary" @click="saveLog">💾 永久落盘保存</button>
             </div>
           </div>
 
-          <div class="editor-body">
-            <textarea 
-              ref="editorTextarea"
-              class="markdown-textarea" 
-              v-model="currentContent" 
-              placeholder="开始编写实验步骤、观察结果或分析数据...\n\n支持 Markdown 语法。输入 @ 检索物理样本库..."
-              @input="handleInput"
-              @keydown="handleKeydown"
-            ></textarea>
+          <div class="editor-body" :class="{ 'is-split': isSplitView }">
+            
+            <div class="textarea-wrapper">
+              <textarea 
+                ref="editorTextarea"
+                class="markdown-textarea" 
+                v-model="currentContent" 
+                placeholder="开始编写实验步骤、观察结果或分析数据...\n\n支持 Markdown 语法 (如 # 标题, **加粗**)。\n\n输入 @ 检索物理样本库..."
+                @input="handleInput"
+                @keydown="handleKeydown"
+                @scroll="syncScroll"
+              ></textarea>
 
-            <div 
-              v-if="showMentionMenu" 
-              class="mention-menu card fade-in"
-              :style="{ top: mentionMenuPos.y + 'px', left: mentionMenuPos.x + 'px' }"
-            >
-              <div class="menu-header">🔍 检索物理样本: "{{ mentionQuery }}"</div>
-              <div class="menu-list" v-if="mentionResults.length > 0">
-                <div 
-                  v-for="(res, idx) in mentionResults" 
-                  :key="idx"
-                  class="menu-item"
-                  :class="{ 'selected': mentionSelectedIndex === idx }"
-                  @click="insertMention(res)"
-                  @mouseover="mentionSelectedIndex = idx"
-                >
-                  <span class="item-icon">{{ res.icon }}</span>
-                  <div class="item-info">
-                    <div class="item-title">{{ res.title }}</div>
-                    <div class="item-desc">{{ res.desc }}</div>
+              <div 
+                v-if="showMentionMenu" 
+                class="mention-menu card fade-in"
+                :style="{ top: mentionMenuPos.y + 'px', left: mentionMenuPos.x + 'px' }"
+              >
+                <div class="menu-header">🔍 检索物理样本: "{{ mentionQuery }}"</div>
+                <div class="menu-list" v-if="mentionResults.length > 0">
+                  <div 
+                    v-for="(res, idx) in mentionResults" 
+                    :key="idx"
+                    class="menu-item"
+                    :class="{ 'selected': mentionSelectedIndex === idx }"
+                    @click="insertMention(res)"
+                    @mouseover="mentionSelectedIndex = idx"
+                  >
+                    <span class="item-icon">{{ res.icon }}</span>
+                    <div class="item-info">
+                      <div class="item-title">{{ res.title }}</div>
+                      <div class="item-desc">{{ res.desc }}</div>
+                    </div>
                   </div>
                 </div>
-              </div>
-              <div class="menu-empty" v-else>
-                <span v-if="isSearching">正在跨维度搜索宇宙...</span>
-                <span v-else>未找到名为 "{{ mentionQuery }}" 的样本</span>
+                <div class="menu-empty" v-else>
+                  <span v-if="isSearching">正在跨维度搜索宇宙...</span>
+                  <span v-else>未找到名为 "{{ mentionQuery }}" 的样本</span>
+                </div>
               </div>
             </div>
+
+            <div 
+              v-if="isSplitView" 
+              class="markdown-preview" 
+              ref="previewDiv"
+              v-html="compiledMarkdown"
+            ></div>
+
           </div>
           
           <div class="editor-footer">
@@ -120,15 +132,29 @@
 </template>
 
 <script setup lang="ts">
-import { ref, onMounted, nextTick } from 'vue'
+import { ref, computed, onMounted, nextTick } from 'vue'
 
-// ================= 基础状态 =================
 const logs = ref<any[]>([])
 const activeLogIndex = ref<number | null>(null)
 const isCreatingNew = ref(false)
 
 const currentTitle = ref('')
 const currentContent = ref('')
+
+// ================= Markdown 渲染状态 =================
+const isSplitView = ref(false) // 是否开启双栏渲染模式
+const previewDiv = ref<HTMLElement | null>(null)
+const isMarkedLoaded = ref(false)
+
+const compiledMarkdown = computed(() => {
+  if (!currentContent.value) return '<div class="empty-hint" style="text-align:center; padding-top: 50px; color:#45475a;">暂无正文内容...</div>'
+  if (isMarkedLoaded.value && (window as any).marked) {
+    // 开启 Markdown 中的换行支持
+    (window as any).marked.setOptions({ breaks: true, gfm: true })
+    return (window as any).marked.parse(currentContent.value)
+  }
+  return '<div style="color: #cdd6f4;">正在加载 Markdown 渲染引擎...</div>'
+})
 
 // ================= @ 提及智能引擎状态 =================
 const editorTextarea = ref<HTMLTextAreaElement | null>(null)
@@ -145,88 +171,40 @@ const fetchLogs = async () => {
   try {
     const res = await fetch('http://127.0.0.1:8080/api/eln/recent')
     const json = await res.json()
-    if (json.code === 200) {
-      logs.value = json.data
-    }
-  } catch (e) {
-    console.error("ELN 同步失败", e)
-  }
+    if (json.code === 200) logs.value = json.data
+  } catch (e) { console.error("ELN 同步失败", e) }
 }
 
-// ================= 列表与落盘交互 =================
 const selectLog = (idx: number) => {
-  activeLogIndex.value = idx
-  isCreatingNew.value = false
-  const rawText = logs.value[idx].title || ''
-  const lines = rawText.split('\n')
+  activeLogIndex.value = idx; isCreatingNew.value = false
+  const rawText = logs.value[idx].title || ''; const lines = rawText.split('\n')
   currentTitle.value = extractTitle(rawText)
   currentContent.value = lines.slice(1).join('\n').trim() || rawText
 }
 
-const createNewLog = () => {
-  activeLogIndex.value = null
-  isCreatingNew.value = true
-  currentTitle.value = ''
-  currentContent.value = ''
-}
+const createNewLog = () => { activeLogIndex.value = null; isCreatingNew.value = true; currentTitle.value = ''; currentContent.value = '' }
 
-// 🚨 真正的持久化落盘逻辑
 const saveLog = async () => {
-  if (!currentTitle.value.trim() && !currentContent.value.trim()) {
-    alert("请输入实验记录内容！")
-    return
-  }
-
+  if (!currentTitle.value.trim() && !currentContent.value.trim()) return alert("请输入实验记录内容！")
   const payload = {
-    date: new Date().toISOString().split('T')[0], // 默认存入今日
+    date: new Date().toISOString().split('T')[0],
     title: currentTitle.value || '无标题实验记录',
     content: currentContent.value
   }
-
   try {
-    const res = await fetch('http://127.0.0.1:8080/api/eln/save', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(payload)
-    })
-    const json = await res.json()
-    if (json.code === 200) {
-      // 保存成功后刷新左侧列表，并定位到第一条
-      await fetchLogs()
-      selectLog(0) 
-      alert("✅ 实验记录已成功永久归档！")
-    } else {
-      alert("❌ 保存失败：" + json.message)
-    }
-  } catch (e) {
-    console.error("保存失败", e)
-    alert("网络请求失败，请检查底层引擎是否在线。")
-  }
+    const res = await fetch('http://127.0.0.1:8080/api/eln/save', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload) })
+    if ((await res.json()).code === 200) { await fetchLogs(); selectLog(0); alert("✅ 实验记录已成功永久归档！") }
+  } catch (e) { alert("网络请求失败，请检查底层引擎。") }
 }
 
-// 辅助函数
-const extractTitle = (text: string) => {
-  if (!text) return '无标题记录'
-  const firstLine = text.split('\n')[0].trim()
-  return firstLine.length > 30 ? firstLine.substring(0, 30) + '...' : firstLine
-}
-const extractPreview = (text: string) => {
-  if (!text) return ''
-  const lines = text.split('\n')
-  if (lines.length > 1) {
-    const preview = lines[1].trim()
-    return preview.length > 40 ? preview.substring(0, 40) + '...' : preview
-  }
-  return '无正文预览'
-}
+const extractTitle = (text: string) => { if (!text) return '无标题记录'; const firstLine = text.split('\n')[0].trim(); return firstLine.length > 30 ? firstLine.substring(0, 30) + '...' : firstLine }
+const extractPreview = (text: string) => { if (!text) return ''; const lines = text.split('\n'); if (lines.length > 1) { const preview = lines[1].trim(); return preview.length > 40 ? preview.substring(0, 40) + '...' : preview } return '无正文预览' }
 
-// ================= @ 智能唤醒引擎 =================
+// ================= 智能联动与渲染逻辑 =================
 let searchTimeout: any = null
 
 const handleInput = (e: Event) => {
-  const textarea = editorTextarea.value
-  if (!textarea) return
-  
+  const textarea = editorTextarea.value; if (!textarea) return
   const cursorPosition = textarea.selectionStart
   const textBeforeCursor = currentContent.value.substring(0, cursorPosition)
   const match = textBeforeCursor.match(/@([^\s]*)$/)
@@ -236,72 +214,70 @@ const handleInput = (e: Event) => {
     mentionStartIndex.value = cursorPosition - match[1].length - 1
     updateMentionPosition()
     showMentionMenu.value = true
-    
     clearTimeout(searchTimeout)
-    searchTimeout = setTimeout(() => {
-      executeGlobalSearch(mentionQuery.value)
-    }, 300)
-  } else {
-    showMentionMenu.value = false
-  }
+    searchTimeout = setTimeout(() => { executeGlobalSearch(mentionQuery.value) }, 300)
+  } else { showMentionMenu.value = false }
 }
 
 const handleKeydown = (e: KeyboardEvent) => {
   if (!showMentionMenu.value) return
-  if (e.key === 'ArrowDown') {
-    e.preventDefault(); mentionSelectedIndex.value = (mentionSelectedIndex.value + 1) % mentionResults.value.length
-  } else if (e.key === 'ArrowUp') {
-    e.preventDefault(); mentionSelectedIndex.value = (mentionSelectedIndex.value - 1 + mentionResults.value.length) % mentionResults.value.length
-  } else if (e.key === 'Enter') {
-    e.preventDefault(); if (mentionResults.value.length > 0) insertMention(mentionResults.value[mentionSelectedIndex.value])
-  } else if (e.key === 'Escape') {
-    showMentionMenu.value = false
-  }
+  if (e.key === 'ArrowDown') { e.preventDefault(); mentionSelectedIndex.value = (mentionSelectedIndex.value + 1) % (mentionResults.value.length || 1) } 
+  else if (e.key === 'ArrowUp') { e.preventDefault(); mentionSelectedIndex.value = (mentionSelectedIndex.value - 1 + mentionResults.value.length) % (mentionResults.value.length || 1) } 
+  else if (e.key === 'Enter') { e.preventDefault(); if (mentionResults.value.length > 0) insertMention(mentionResults.value[mentionSelectedIndex.value]) } 
+  else if (e.key === 'Escape') { showMentionMenu.value = false }
 }
 
 const updateMentionPosition = () => {
   if (!editorTextarea.value) return
   const textBefore = currentContent.value.substring(0, mentionStartIndex.value)
   const lines = textBefore.split('\n')
-  const currentLineIndex = lines.length
-  const lineHeight = 24 
-  mentionMenuPos.value = {
-    x: 20 + (lines[lines.length - 1].length * 8), 
-    y: 80 + (currentLineIndex * lineHeight)       
-  }
+  mentionMenuPos.value = { x: 20 + (lines[lines.length - 1].length * 8), y: 40 + (lines.length * 24) - editorTextarea.value.scrollTop }
 }
 
 const executeGlobalSearch = async (query: string) => {
   if (!query) { mentionResults.value = []; return }
   isSearching.value = true
   try {
-    const res = await fetch(`http://127.0.0.1:8080/api/search/omnibar?q=${encodeURIComponent(query)}`)
-    const json = await res.json()
+    const json = await (await fetch(`http://127.0.0.1:8080/api/search/omnibar?q=${encodeURIComponent(query)}`)).json()
     if (json.code === 200) { mentionResults.value = json.data; mentionSelectedIndex.value = 0 }
-  } catch (e) { console.error("跨域检索失败", e) } finally { isSearching.value = false }
+  } catch (e) {} finally { isSearching.value = false }
 }
 
 const insertMention = (item: any) => {
-  const textarea = editorTextarea.value
-  if (!textarea) return
+  const textarea = editorTextarea.value; if (!textarea) return
   const before = currentContent.value.substring(0, mentionStartIndex.value)
   const after = currentContent.value.substring(textarea.selectionStart)
+  // 插入 Markdown 超链接格式，这将在右侧渲染为漂亮的标签
   const mentionText = `[@${item.title}](${item.action_path}) `
   currentContent.value = before + mentionText + after
   showMentionMenu.value = false
-  nextTick(() => {
-    textarea.focus()
-    const newCursorPos = before.length + mentionText.length
-    textarea.setSelectionRange(newCursorPos, newCursorPos)
-  })
+  nextTick(() => { textarea.focus(); const newCursorPos = before.length + mentionText.length; textarea.setSelectionRange(newCursorPos, newCursorPos) })
+}
+
+// 同步滚动效果：左边代码滚动时，右边预览也跟着滚动
+const syncScroll = () => {
+  if (isSplitView.value && editorTextarea.value && previewDiv.value) {
+    const percentage = editorTextarea.value.scrollTop / (editorTextarea.value.scrollHeight - editorTextarea.value.clientHeight)
+    previewDiv.value.scrollTop = percentage * (previewDiv.value.scrollHeight - previewDiv.value.clientHeight)
+  }
 }
 
 onMounted(() => {
   fetchLogs()
+  // 动态挂载 Marked.js 渲染引擎
+  if (!(window as any).marked) {
+    const script = document.createElement('script')
+    script.src = 'https://cdn.jsdelivr.net/npm/marked/marked.min.js'
+    script.onload = () => { isMarkedLoaded.value = true }
+    document.head.appendChild(script)
+  } else {
+    isMarkedLoaded.value = true
+  }
 })
 </script>
 
 <style scoped>
+/* 基础与宏观布局 */
 .eln-calendar-view { height: 100%; display: flex; flex-direction: column; padding: 20px; box-sizing: border-box; color: #cdd6f4;}
 .view-header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 20px; border-bottom: 1px solid #313244; padding-bottom: 15px; flex-shrink: 0;}
 .breadcrumbs { display: flex; gap: 10px; align-items: baseline;}
@@ -311,11 +287,15 @@ onMounted(() => {
 .btn-primary:hover { transform: translateY(-2px); box-shadow: 0 4px 12px rgba(203, 166, 247, 0.3); }
 .btn-outline { background: transparent; color: #cba6f7; border: 1px dashed #cba6f7; padding: 10px 20px; border-radius: 8px; cursor: pointer; font-weight: bold; transition: 0.2s; margin-right: 10px;}
 .btn-outline:hover { background: rgba(203, 166, 247, 0.1); }
+.btn-toggle { background: #313244; color: #cdd6f4; border: 1px solid #45475a; padding: 10px 15px; border-radius: 8px; font-weight: bold; cursor: pointer; transition: 0.2s; margin-right: 10px;}
+.btn-toggle:hover { background: #45475a; }
+.btn-toggle.active { background: rgba(203, 166, 247, 0.2); color: #cba6f7; border-color: #cba6f7; }
 .btn-small { padding: 6px 12px; font-size: 12px; }
 
 .split-layout { display: flex; gap: 20px; flex: 1; min-height: 0;}
 .card { background: #181825; border: 1px solid #313244; border-radius: 12px;}
 
+/* 侧边时间轴 */
 .timeline-sidebar { flex: 1; max-width: 320px; display: flex; flex-direction: column; overflow: hidden; }
 .sidebar-header { padding: 20px; border-bottom: 1px solid #313244; display: flex; justify-content: space-between; align-items: center; background: #11111b; border-radius: 12px 12px 0 0;}
 .sidebar-header h3 { margin: 0; color: #cdd6f4; font-size: 16px;}
@@ -334,6 +314,7 @@ onMounted(() => {
 .log-meta .tag.warning { background: rgba(249, 226, 175, 0.15); color: #f9e2af;}
 .log-meta .tag.success { background: rgba(166, 227, 161, 0.15); color: #a6e3a1;}
 
+/* 编辑器工作区 */
 .editor-workspace { flex: 3; display: flex; flex-direction: column; overflow: hidden; background: #11111b;}
 .editor-empty { flex: 1; display: flex; flex-direction: column; align-items: center; justify-content: center; color: #bac2de;}
 .editor-container { flex: 1; display: flex; flex-direction: column; height: 100%; position: relative;}
@@ -341,12 +322,54 @@ onMounted(() => {
 .title-input { flex: 1; background: transparent; border: none; font-size: 24px; font-weight: bold; color: #cdd6f4; outline: none;}
 .title-input::placeholder { color: #45475a;}
 .editor-tools { display: flex; align-items: center; flex-shrink: 0;}
-.editor-body { flex: 1; position: relative; display: flex;}
-.markdown-textarea { flex: 1; width: 100%; padding: 30px; background: transparent; border: none; color: #bac2de; font-size: 15px; line-height: 1.8; font-family: 'Consolas', 'Courier New', monospace; outline: none; resize: none;}
+
+/* 🚨 双栏模式核心布局 */
+.editor-body { flex: 1; display: flex; overflow: hidden; position: relative;}
+.textarea-wrapper { flex: 1; position: relative; display: flex; flex-direction: column; }
+.markdown-textarea { 
+  flex: 1; width: 100%; padding: 30px; background: transparent; border: none; 
+  color: #bac2de; font-size: 15px; line-height: 1.8; font-family: 'Consolas', 'Courier New', monospace;
+  outline: none; resize: none;
+}
 .markdown-textarea::placeholder { color: #45475a;}
+
+/* 🚨 优美的 Markdown 渲染区样式 */
+.is-split .textarea-wrapper { border-right: 1px solid #313244; }
+.markdown-preview {
+  flex: 1; padding: 30px; overflow-y: auto; color: #cdd6f4; font-size: 15px; line-height: 1.8; background: #181825;
+}
+/* 渲染 Markdown 各种标签 */
+.markdown-preview :deep(h1), .markdown-preview :deep(h2), .markdown-preview :deep(h3) { margin-top: 1.5em; margin-bottom: 0.5em; color: #89b4fa; }
+.markdown-preview :deep(h1) { font-size: 24px; border-bottom: 1px dashed #313244; padding-bottom: 10px; }
+.markdown-preview :deep(h2) { font-size: 20px; }
+.markdown-preview :deep(p) { margin-bottom: 1em; }
+.markdown-preview :deep(ul), .markdown-preview :deep(ol) { margin-bottom: 1em; padding-left: 20px; }
+.markdown-preview :deep(code) { background: #11111b; padding: 2px 6px; border-radius: 4px; font-family: monospace; color: #f9e2af; border: 1px solid #313244; }
+.markdown-preview :deep(blockquote) { border-left: 4px solid #cba6f7; padding-left: 15px; margin: 1em 0; color: #a6adc8; font-style: italic; background: rgba(203, 166, 247, 0.05); padding: 10px 15px; }
+
+/* 🚨 高亮 @关联的物理样本链接 -> 变成科技胶囊 */
+.markdown-preview :deep(a) {
+  display: inline-block;
+  background: rgba(203, 166, 247, 0.2);
+  color: #cba6f7;
+  padding: 2px 10px;
+  border-radius: 12px;
+  text-decoration: none;
+  font-weight: bold;
+  font-size: 13px;
+  border: 1px solid rgba(203, 166, 247, 0.5);
+  transition: 0.2s;
+  margin: 0 2px;
+}
+.markdown-preview :deep(a:hover) {
+  background: rgba(203, 166, 247, 0.4);
+  box-shadow: 0 0 10px rgba(203, 166, 247, 0.3);
+}
+
 .editor-footer { padding: 15px 30px; border-top: 1px solid #313244; background: #181825; border-radius: 0 0 12px 12px; flex-shrink: 0;}
 .attachment-bar { display: flex; justify-content: space-between; align-items: center;}
 
+/* @悬浮菜单 */
 .mention-menu { position: absolute; width: 350px; background: #1e1e2e; border: 1px solid #cba6f7; box-shadow: 0 10px 30px rgba(0,0,0,0.5); z-index: 100; overflow: hidden;}
 .menu-header { padding: 10px 15px; background: #11111b; color: #cba6f7; font-size: 12px; font-weight: bold; border-bottom: 1px solid #313244;}
 .menu-list { max-height: 300px; overflow-y: auto;}
@@ -357,7 +380,6 @@ onMounted(() => {
 .item-title { font-weight: bold; color: #cdd6f4; font-size: 14px; margin-bottom: 4px;}
 .item-desc { font-size: 11px; color: #a6adc8; white-space: nowrap; overflow: hidden; text-overflow: ellipsis;}
 .menu-empty { padding: 20px; text-align: center; color: #6c7086; font-size: 13px;}
-
 .empty-state { text-align: center; padding: 60px 20px;}
 .empty-icon { font-size: 48px; margin-bottom: 15px; opacity: 0.5;}
 .empty-text { color: #6c7086; font-size: 14px; font-weight: bold;}

@@ -89,8 +89,11 @@
             </div>
           </div>
           <div class="preview-actions">
-            <button class="btn-primary" v-if="['.pdb', '.cif'].includes(previewFile.ext)" @click="alert('未来将在此处挂载 3Dmol.js WebGL 视图！')">
+            <button class="btn-primary" v-if="['.pdb', '.cif'].includes(previewFile.ext) && !is3DMode" @click="init3DViewer">
               👁️ 启动 3D 渲染器
+            </button>
+            <button class="btn-outline" style="border-color: #89b4fa; color: #89b4fa;" v-if="is3DMode" @click="is3DMode = false">
+              📄 退出 3D 回到源代码
             </button>
             <button class="icon-btn" style="background: transparent; font-size: 20px;" @click="closePreview">✖</button>
           </div>
@@ -106,7 +109,21 @@
             {{ previewError }}
           </div>
 
-          <div v-else class="code-editor-container">
+          <div v-else-if="is3DMode" class="viewer-3d-wrapper fade-in">
+             <div v-if="is3DLoadingEngine" class="loading-state" style="position: absolute; width: 100%; height: 100%; z-index: 10;">
+               <span class="spin-loader">🧬</span> 正在动态挂载 3Dmol.js WebGL 引擎...
+             </div>
+             
+             <div id="viewer-3d" style="width: 100%; height: 100%; position: relative;"></div>
+             
+             <div class="viewer-3d-tools" v-if="viewerInstance">
+                <button class="tool-btn" @click="set3DStyle('cartoon')">🌈 Cartoon (卡通模型)</button>
+                <button class="tool-btn" @click="set3DStyle('sphere')">☁️ Surface (表面电荷)</button>
+                <button class="tool-btn" @click="set3DStyle('stick')">🥢 Stick (球棍残基)</button>
+             </div>
+          </div>
+
+          <div v-else class="code-editor-container fade-in">
             <div class="line-numbers">
               <div v-for="n in lineCount" :key="n" class="line-number">{{ n }}</div>
             </div>
@@ -120,7 +137,7 @@
 </template>
 
 <script setup lang="ts">
-import { ref, computed, onMounted } from 'vue'
+import { ref, computed, onMounted, nextTick } from 'vue'
 
 const currentPath = ref('')
 const files = ref<any[]>([])
@@ -131,6 +148,12 @@ const previewContent = ref('')
 const isPreviewLoading = ref(false)
 const previewError = ref('')
 
+// 🚨 3D 渲染器核心状态
+const is3DMode = ref(false)
+const is3DLoadingEngine = ref(false)
+const viewerInstance = ref<any>(null)
+
+// 拉取文件列表
 const fetchDirectory = async (path: string = "") => {
   try {
     const res = await fetch(`http://127.0.0.1:8080/api/data/tree?path=${encodeURIComponent(path)}`)
@@ -153,18 +176,18 @@ const goUp = () => {
   fetchDirectory(parts.join('/'))
 }
 
-// 🚨 核心：双击读取真实物理文件内容
+// 双击文件读取内容
 const handleDoubleClick = async (file: any) => {
   if (file.is_dir) {
     fetchDirectory(file.path)
     return
   }
   
-  // 打开预览弹窗
   previewFile.value = file
   previewContent.value = ''
   previewError.value = ''
   isPreviewLoading.value = true
+  is3DMode.value = false // 默认先打开纯文本
 
   try {
     const res = await fetch(`http://127.0.0.1:8080/api/data/read_file?path=${encodeURIComponent(file.path)}`)
@@ -185,15 +208,81 @@ const handleDoubleClick = async (file: any) => {
 const closePreview = () => {
   previewFile.value = null
   previewContent.value = ''
+  is3DMode.value = false
+  if (viewerInstance.value) {
+    viewerInstance.value.clear()
+    viewerInstance.value = null
+  }
 }
 
-// 计算文本行数，用于渲染左侧的高级代码行号
+// ==========================================
+// 🚨 核心：3Dmol.js 引擎加载与渲染逻辑
+// ==========================================
+const init3DViewer = async () => {
+  is3DMode.value = true
+  is3DLoadingEngine.value = true
+  
+  // 1. 动态注入 3Dmol.js CDN 脚本 (如果还未加载)
+  if (!(window as any).$3Dmol) {
+    await new Promise((resolve, reject) => {
+      const script = document.createElement('script')
+      script.src = 'https://cdnjs.cloudflare.com/ajax/libs/3Dmol/2.0.4/3Dmol-min.js'
+      script.onload = resolve
+      script.onerror = reject
+      document.head.appendChild(script)
+    })
+  }
+  
+  is3DLoadingEngine.value = false
+
+  // 2. 初始化 WebGL 画布并渲染结构
+  nextTick(() => {
+    const element = document.getElementById('viewer-3d')
+    const $3Dmol = (window as any).$3Dmol
+    
+    if (element && $3Dmol) {
+      // 创建 Viewer，背景设为契合我们 UI 的暗色
+      viewerInstance.value = $3Dmol.createViewer(element, {
+        backgroundColor: '#1e1e2e'
+      })
+      
+      // 去除后缀的点（例如 .pdb -> pdb）
+      const format = previewFile.value.ext.replace('.', '')
+      viewerInstance.value.addModel(previewContent.value, format)
+      
+      // 默认设置为基于残基性质光谱着色的卡通模型
+      viewerInstance.value.setStyle({}, { cartoon: { color: 'spectrum' } })
+      viewerInstance.value.zoomTo()
+      viewerInstance.value.render()
+    }
+  })
+}
+
+// 动态切换 3D 显示样式
+const set3DStyle = (styleType: 'cartoon' | 'sphere' | 'stick') => {
+  if (!viewerInstance.value) return
+  
+  viewerInstance.value.setStyle({}, {}) // 先清除样式
+  
+  if (styleType === 'cartoon') {
+    viewerInstance.value.setStyle({}, { cartoon: { color: 'spectrum' } })
+  } else if (styleType === 'sphere') {
+    // 表面电荷/实体球状模型
+    viewerInstance.value.setStyle({}, { sphere: { color: 'chain' } }) 
+  } else if (styleType === 'stick') {
+    // 细致的原子球棍模型
+    viewerInstance.value.setStyle({}, { stick: {} })
+  }
+  
+  viewerInstance.value.render()
+}
+// ==========================================
+
 const lineCount = computed(() => {
   if (!previewContent.value) return 0
   return previewContent.value.split('\n').length
 })
 
-// 根据不同后缀给代码块不同的颜色区分
 const getHighlightClass = (ext: string) => {
   ext = ext.toLowerCase()
   if (ext === '.pdb' || ext === '.cif') return 'lang-pdb'
@@ -302,15 +391,25 @@ onMounted(() => {
 .loading-state, .error-state { flex: 1; display: flex; flex-direction: column; align-items: center; justify-content: center; color: #6c7086; font-size: 16px; }
 .error-state { color: #f38ba8; }
 
+/* 🚨 3D Viewer 专属样式 */
+.viewer-3d-wrapper { flex: 1; width: 100%; height: 100%; position: relative; background: #1e1e2e; }
+.viewer-3d-tools {
+  position: absolute; bottom: 20px; left: 50%; transform: translateX(-50%);
+  display: flex; gap: 10px; background: rgba(17, 17, 27, 0.8); padding: 10px; border-radius: 12px; border: 1px solid #45475a; z-index: 100;
+}
+.tool-btn {
+  background: transparent; color: #cdd6f4; border: 1px solid #45475a; padding: 8px 15px; border-radius: 6px; cursor: pointer; transition: 0.2s; font-size: 13px; font-weight: bold;
+}
+.tool-btn:hover { background: #89b4fa; color: #11111b; border-color: #89b4fa;}
+
 .code-editor-container { flex: 1; display: flex; overflow: auto; background: #1e1e2e; }
 .line-numbers { padding: 20px 10px; background: #11111b; border-right: 1px solid #313244; text-align: right; color: #45475a; font-family: 'Consolas', monospace; font-size: 13px; user-select: none;}
 .line-number { line-height: 1.5; }
 .code-content { margin: 0; padding: 20px; color: #cdd6f4; font-family: 'Consolas', 'Courier New', monospace; font-size: 13px; line-height: 1.5; white-space: pre; flex: 1;}
 
-/* 极客配色高亮 */
-.lang-pdb { color: #f9e2af; }   /* PDB显示为黄色 */
-.lang-fasta { color: #a6e3a1; } /* 序列显示为绿色 */
-.lang-json { color: #89b4fa; }  /* JSON显示为蓝色 */
+.lang-pdb { color: #f9e2af; }   
+.lang-fasta { color: #a6e3a1; } 
+.lang-json { color: #89b4fa; }  
 
 .spin-loader { display: inline-block; animation: spin 2s linear infinite; font-size: 24px; margin-bottom: 15px;}
 @keyframes spin { 100% { transform: rotate(360deg); } }
