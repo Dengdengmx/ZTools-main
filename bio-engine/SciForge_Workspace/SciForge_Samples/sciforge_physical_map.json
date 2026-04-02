@@ -16,6 +16,15 @@
                     "rs": 1,
                     "cs": 3,
                     "id": "cont_301c1b"
+                },
+                "cont_8ebb66": {
+                    "name": "新容器",
+                    "type": "9x9",
+                    "r": 0,
+                    "c": 0,
+                    "rs": 1,
+                    "cs": 1,
+                    "id": "cont_8ebb66"
                 }
             },
             "inner_boxes": {}
@@ -47,7 +56,19 @@
             "cols": 6,
             "desc": "核心资产区。用于长期冻存甘油菌、质粒、细胞株、珍贵蛋白样本等。",
             "icon": "snowflake",
-            "containers": {},
+            "containers": {
+                "cont_a4322b": {
+                    "name": "新容器",
+                    "type": "rack",
+                    "r": 0,
+                    "c": 0,
+                    "rs": 1,
+                    "cs": 1,
+                    "layers": 5,
+                    "boxes": 4,
+                    "id": "cont_a4322b"
+                }
+            },
             "inner_boxes": {}
         }
     },

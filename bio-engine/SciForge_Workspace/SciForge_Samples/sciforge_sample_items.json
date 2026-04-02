@@ -1,17 +1,18 @@
 {
-    "equip_drawer/cont_301c1b": {
-        "F-1": {
-            "id": "SPL-F-1",
-            "name": "11",
+    "equip_drawer/cont_301c1b": {},
+    "equip_drawer/cont_8ebb66": {
+        "A2": {
+            "id": "SPL-A2",
+            "name": "111",
             "type": "🧬 质粒 (Plasmid)",
-            "vol": 100.0,
+            "vol": 80.0,
             "unit": "μL",
-            "ft": 11,
+            "ft": 2,
             "owner": "Admin",
-            "notes": "11",
-            "deposit_time": "2026-04-01 22:38:18",
-            "x": 67.0,
-            "y": 27.0
+            "notes": "[2026-04-02 11:27:03] 👤Admin 取用了 10.0μL, 冻融次数+1。附言: \n[2026-04-02 11:26:53] 👤Admin 取用了 10.0μL, 冻融次数+1。附言: ",
+            "x": 20.0,
+            "y": 20.0,
+            "deposit_time": "2026-04-02 11:26:44"
         }
     }
 }

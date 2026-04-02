@@ -1,169 +1,366 @@
 <template>
-  <div class="eln-view">
-    
+  <div class="eln-calendar-view">
     <div class="view-header">
-      <h2>📓 实验记录 (ELN)</h2>
-      <button class="btn-create" @click="createNewLog">+ 新建实验 (Protocol)</button>
+      <div class="breadcrumbs">
+        <h2 class="active">📓 ELN 实验记录与日程 (智能联动版)</h2>
+      </div>
+      <div class="header-actions">
+        <button class="btn-outline" @click="createNewLog">📝 新建今日实验</button>
+        <button class="btn-primary" @click="fetchLogs">🔄 从核心同步数据</button>
+      </div>
     </div>
-    
+
     <div class="split-layout">
-      <div class="calendar-section card">
-        <div class="month-header">
-          <button class="icon-btn">◀</button>
-          <h3>2026年 3月</h3>
-          <button class="icon-btn">▶</button>
+      <div class="timeline-sidebar card">
+        <div class="sidebar-header">
+          <h3>📅 实验时间轴</h3>
+          <span class="count-badge">{{ logs.length }} 条记录</span>
         </div>
-        <div class="weekdays">
-          <span>一</span><span>二</span><span>三</span><span>四</span><span>五</span><span>六</span><span>日</span>
+        
+        <div class="empty-state" v-if="logs.length === 0">
+          <div class="empty-icon">📭</div>
+          <div class="empty-text">暂无实验记录</div>
         </div>
-        <div class="days-grid">
-          <div class="day empty" v-for="n in 6" :key="'empty'+n"></div>
-          <div class="day" v-for="day in 31" :key="day" :class="{ 'active': selectedDay === day, 'has-log': hasLog(day) }" @click="selectedDay = day">
-            <span class="date-num">{{ day }}</span>
-            <div class="dots" v-if="hasLog(day)"><span class="dot"></span></div>
+
+        <div class="timeline-list" v-else>
+          <div 
+            v-for="(log, idx) in logs" 
+            :key="idx" 
+            class="timeline-item fade-in"
+            :class="{ 'active': activeLogIndex === idx }"
+            @click="selectLog(idx)"
+          >
+            <div class="timeline-date">
+              <span class="date-dot"></span>
+              {{ log.date }}
+            </div>
+            <div class="timeline-content">
+              <h4 class="log-title">{{ extractTitle(log.title) }}</h4>
+              <p class="log-preview">{{ extractPreview(log.title) }}</p>
+              <div class="log-meta">
+                <span class="tag" :class="log.status === '进行中' ? 'warning' : 'success'">{{ log.status || '已归档' }}</span>
+              </div>
+            </div>
           </div>
         </div>
       </div>
-      
-      <div class="logs-section card">
-        <h3>📅 3月{{ selectedDay }}日 的实验流</h3>
-        <div v-if="loading" class="empty-state">正在呼叫 127.0.0.1:8080 获取数据...</div>
-        <div v-else-if="currentLogs.length === 0" class="empty-state">无实验记录，去休息一下或者喝杯咖啡吧 ☕</div>
-        <ul v-else class="log-list">
-          <li v-for="log in currentLogs" :key="log.id" class="log-item">
-            <div class="log-info"><span class="log-id">[{{ log.id }}]</span><span class="log-title">{{ log.title }}</span></div>
-            <span class="status-badge" :class="log.status">{{ log.status }}</span>
-          </li>
-        </ul>
-      </div>
-    </div> <div v-if="showPrompt" class="modal-overlay">
-      <div class="modal-content card fade-in">
-        <h3>✨ 新建实验记录 (3月{{ selectedDay }}日)</h3>
-        <input 
-          v-model="newLogTitle" 
-          class="input-dark" 
-          placeholder="输入实验标题 (例如: 诱导表达重组蛋白)" 
-          @keyup.enter="confirmCreate" 
-          autofocus
-        />
-        <div class="modal-actions">
-          <button class="btn-cancel" @click="showPrompt = false">取消</button>
-          <button class="btn-primary" @click="confirmCreate">确认创建</button>
+
+      <div class="editor-workspace card">
+        <div v-if="activeLogIndex === null && !isCreatingNew" class="editor-empty">
+          <div class="empty-icon" style="font-size: 64px; margin-bottom: 20px;">✍️</div>
+          <h2>请在左侧选择一条实验记录，或新建实验</h2>
+          <p style="color: #6c7086;">支持 Markdown 语法与 @ 样本智能关联</p>
+        </div>
+
+        <div v-else class="editor-container fade-in">
+          <div class="editor-header">
+            <input 
+              type="text" 
+              class="title-input" 
+              v-model="currentTitle" 
+              placeholder="无标题实验记录..."
+            />
+            <div class="editor-tools">
+              <span style="font-size: 12px; color: #a6adc8; margin-right: 15px;">
+                💡 提示: 在正文中输入 <b>@</b> 可直接检索并绑定物理样本
+              </span>
+              <button class="btn-primary" @click="saveLog">💾 永久落盘保存</button>
+            </div>
+          </div>
+
+          <div class="editor-body">
+            <textarea 
+              ref="editorTextarea"
+              class="markdown-textarea" 
+              v-model="currentContent" 
+              placeholder="开始编写实验步骤、观察结果或分析数据...\n\n支持 Markdown 语法。输入 @ 检索物理样本库..."
+              @input="handleInput"
+              @keydown="handleKeydown"
+            ></textarea>
+
+            <div 
+              v-if="showMentionMenu" 
+              class="mention-menu card fade-in"
+              :style="{ top: mentionMenuPos.y + 'px', left: mentionMenuPos.x + 'px' }"
+            >
+              <div class="menu-header">🔍 检索物理样本: "{{ mentionQuery }}"</div>
+              <div class="menu-list" v-if="mentionResults.length > 0">
+                <div 
+                  v-for="(res, idx) in mentionResults" 
+                  :key="idx"
+                  class="menu-item"
+                  :class="{ 'selected': mentionSelectedIndex === idx }"
+                  @click="insertMention(res)"
+                  @mouseover="mentionSelectedIndex = idx"
+                >
+                  <span class="item-icon">{{ res.icon }}</span>
+                  <div class="item-info">
+                    <div class="item-title">{{ res.title }}</div>
+                    <div class="item-desc">{{ res.desc }}</div>
+                  </div>
+                </div>
+              </div>
+              <div class="menu-empty" v-else>
+                <span v-if="isSearching">正在跨维度搜索宇宙...</span>
+                <span v-else>未找到名为 "{{ mentionQuery }}" 的样本</span>
+              </div>
+            </div>
+          </div>
+          
+          <div class="editor-footer">
+            <div class="attachment-bar">
+              <span style="color: #6c7086; font-weight: bold; font-size: 12px;">📎 关联数据与图谱 (DataHub)</span>
+              <button class="btn-outline btn-small">+ 挂载凝胶图/序列文件</button>
+            </div>
+          </div>
         </div>
       </div>
     </div>
-    
-  </div> </template>
+  </div>
+</template>
 
 <script setup lang="ts">
-import { ref, onMounted, computed } from 'vue'
-const selectedDay = ref(30)
-const loading = ref(true)
-const logs = ref<any[]>([])
+import { ref, onMounted, nextTick } from 'vue'
 
+// ================= 基础状态 =================
+const logs = ref<any[]>([])
+const activeLogIndex = ref<number | null>(null)
+const isCreatingNew = ref(false)
+
+const currentTitle = ref('')
+const currentContent = ref('')
+
+// ================= @ 提及智能引擎状态 =================
+const editorTextarea = ref<HTMLTextAreaElement | null>(null)
+const showMentionMenu = ref(false)
+const mentionQuery = ref('')
+const mentionResults = ref<any[]>([])
+const mentionMenuPos = ref({ x: 0, y: 0 })
+const mentionSelectedIndex = ref(0)
+const isSearching = ref(false)
+const mentionStartIndex = ref(-1)
+
+// ================= API 与数据获取 =================
 const fetchLogs = async () => {
   try {
     const res = await fetch('http://127.0.0.1:8080/api/eln/recent')
-    const data = await res.json()
-    if (data.code === 200) logs.value = data.data
-  } catch (e) {
-    console.error("引擎未连接", e)
-  } finally {
-    loading.value = false
-  }
-}
-
-const hasLog = (day: number) => {
-  const dayStr = day < 10 ? `0${day}` : `${day}`
-  return logs.value.some(log => log.date.endsWith(`-${dayStr}`))
-}
-
-const currentLogs = computed(() => {
-  const dayStr = selectedDay.value < 10 ? `0${selectedDay.value}` : `${selectedDay.value}`
-  return logs.value.filter(log => log.date.endsWith(`-${dayStr}`))
-})
-
-// ... 保持原有的 fetchLogs 等代码 ...
-
-// ... 原有的 import 保持不变 ...
-const showPrompt = ref(false)
-const newLogTitle = ref('')
-
-// 1. 点击按钮时，只负责呼出弹窗
-const createNewLog = () => {
-  newLogTitle.value = ''
-  showPrompt.value = true
-}
-
-// 2. 确认创建时，真正发送给 Python 后端
-const confirmCreate = async () => {
-  if (!newLogTitle.value.trim()) return // 防空输入
-
-  const dayStr = selectedDay.value < 10 ? `0${selectedDay.value}` : `${selectedDay.value}`
-  const dateStr = `2026-03-${dayStr}`
-
-  try {
-    const res = await fetch('http://127.0.0.1:8080/api/eln/add', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ title: newLogTitle.value, date: dateStr, status: '进行中' })
-    })
-    
-    if (res.ok) {
-      showPrompt.value = false // 关闭弹窗
-      fetchLogs() // 刷新列表！
+    const json = await res.json()
+    if (json.code === 200) {
+      logs.value = json.data
     }
   } catch (e) {
-    console.error("引擎未连接", e)
+    console.error("ELN 同步失败", e)
   }
 }
 
-onMounted(() => fetchLogs())
+// ================= 列表与落盘交互 =================
+const selectLog = (idx: number) => {
+  activeLogIndex.value = idx
+  isCreatingNew.value = false
+  const rawText = logs.value[idx].title || ''
+  const lines = rawText.split('\n')
+  currentTitle.value = extractTitle(rawText)
+  currentContent.value = lines.slice(1).join('\n').trim() || rawText
+}
+
+const createNewLog = () => {
+  activeLogIndex.value = null
+  isCreatingNew.value = true
+  currentTitle.value = ''
+  currentContent.value = ''
+}
+
+// 🚨 真正的持久化落盘逻辑
+const saveLog = async () => {
+  if (!currentTitle.value.trim() && !currentContent.value.trim()) {
+    alert("请输入实验记录内容！")
+    return
+  }
+
+  const payload = {
+    date: new Date().toISOString().split('T')[0], // 默认存入今日
+    title: currentTitle.value || '无标题实验记录',
+    content: currentContent.value
+  }
+
+  try {
+    const res = await fetch('http://127.0.0.1:8080/api/eln/save', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload)
+    })
+    const json = await res.json()
+    if (json.code === 200) {
+      // 保存成功后刷新左侧列表，并定位到第一条
+      await fetchLogs()
+      selectLog(0) 
+      alert("✅ 实验记录已成功永久归档！")
+    } else {
+      alert("❌ 保存失败：" + json.message)
+    }
+  } catch (e) {
+    console.error("保存失败", e)
+    alert("网络请求失败，请检查底层引擎是否在线。")
+  }
+}
+
+// 辅助函数
+const extractTitle = (text: string) => {
+  if (!text) return '无标题记录'
+  const firstLine = text.split('\n')[0].trim()
+  return firstLine.length > 30 ? firstLine.substring(0, 30) + '...' : firstLine
+}
+const extractPreview = (text: string) => {
+  if (!text) return ''
+  const lines = text.split('\n')
+  if (lines.length > 1) {
+    const preview = lines[1].trim()
+    return preview.length > 40 ? preview.substring(0, 40) + '...' : preview
+  }
+  return '无正文预览'
+}
+
+// ================= @ 智能唤醒引擎 =================
+let searchTimeout: any = null
+
+const handleInput = (e: Event) => {
+  const textarea = editorTextarea.value
+  if (!textarea) return
+  
+  const cursorPosition = textarea.selectionStart
+  const textBeforeCursor = currentContent.value.substring(0, cursorPosition)
+  const match = textBeforeCursor.match(/@([^\s]*)$/)
+  
+  if (match) {
+    mentionQuery.value = match[1]
+    mentionStartIndex.value = cursorPosition - match[1].length - 1
+    updateMentionPosition()
+    showMentionMenu.value = true
+    
+    clearTimeout(searchTimeout)
+    searchTimeout = setTimeout(() => {
+      executeGlobalSearch(mentionQuery.value)
+    }, 300)
+  } else {
+    showMentionMenu.value = false
+  }
+}
+
+const handleKeydown = (e: KeyboardEvent) => {
+  if (!showMentionMenu.value) return
+  if (e.key === 'ArrowDown') {
+    e.preventDefault(); mentionSelectedIndex.value = (mentionSelectedIndex.value + 1) % mentionResults.value.length
+  } else if (e.key === 'ArrowUp') {
+    e.preventDefault(); mentionSelectedIndex.value = (mentionSelectedIndex.value - 1 + mentionResults.value.length) % mentionResults.value.length
+  } else if (e.key === 'Enter') {
+    e.preventDefault(); if (mentionResults.value.length > 0) insertMention(mentionResults.value[mentionSelectedIndex.value])
+  } else if (e.key === 'Escape') {
+    showMentionMenu.value = false
+  }
+}
+
+const updateMentionPosition = () => {
+  if (!editorTextarea.value) return
+  const textBefore = currentContent.value.substring(0, mentionStartIndex.value)
+  const lines = textBefore.split('\n')
+  const currentLineIndex = lines.length
+  const lineHeight = 24 
+  mentionMenuPos.value = {
+    x: 20 + (lines[lines.length - 1].length * 8), 
+    y: 80 + (currentLineIndex * lineHeight)       
+  }
+}
+
+const executeGlobalSearch = async (query: string) => {
+  if (!query) { mentionResults.value = []; return }
+  isSearching.value = true
+  try {
+    const res = await fetch(`http://127.0.0.1:8080/api/search/omnibar?q=${encodeURIComponent(query)}`)
+    const json = await res.json()
+    if (json.code === 200) { mentionResults.value = json.data; mentionSelectedIndex.value = 0 }
+  } catch (e) { console.error("跨域检索失败", e) } finally { isSearching.value = false }
+}
+
+const insertMention = (item: any) => {
+  const textarea = editorTextarea.value
+  if (!textarea) return
+  const before = currentContent.value.substring(0, mentionStartIndex.value)
+  const after = currentContent.value.substring(textarea.selectionStart)
+  const mentionText = `[@${item.title}](${item.action_path}) `
+  currentContent.value = before + mentionText + after
+  showMentionMenu.value = false
+  nextTick(() => {
+    textarea.focus()
+    const newCursorPos = before.length + mentionText.length
+    textarea.setSelectionRange(newCursorPos, newCursorPos)
+  })
+}
+
+onMounted(() => {
+  fetchLogs()
+})
 </script>
 
 <style scoped>
-.eln-view { display: flex; flex-direction: column; gap: 20px; height: 100%; }
-.view-header { display: flex; justify-content: space-between; align-items: center; }
-h2, h3 { margin: 0; color: #f5e0dc; }
-.btn-create { background: #89b4fa; color: #11111b; border: none; padding: 10px 20px; border-radius: 8px; font-weight: bold; cursor: pointer; }
-.btn-create:hover { background: #b4befe; }
-.split-layout { display: flex; gap: 20px; flex: 1; }
-.card { background: #181825; border: 1px solid #313244; border-radius: 16px; padding: 25px; box-shadow: 0 4px 15px rgba(0,0,0,0.2); }
-.calendar-section { flex: 1; max-width: 450px; }
-.logs-section { flex: 2; display: flex; flex-direction: column; }
-.month-header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 20px; }
-.icon-btn { background: none; border: none; color: #a6adc8; cursor: pointer; font-size: 18px; }
-.weekdays { display: grid; grid-template-columns: repeat(7, 1fr); text-align: center; color: #6c7086; font-weight: bold; margin-bottom: 15px; }
-.days-grid { display: grid; grid-template-columns: repeat(7, 1fr); gap: 8px; }
-.day { aspect-ratio: 1; display: flex; flex-direction: column; justify-content: center; align-items: center; border-radius: 8px; cursor: pointer; transition: all 0.2s; background: #1e1e2e; border: 1px solid transparent; }
-.day.empty { background: transparent; cursor: default; }
-.day:not(.empty):hover { border-color: #45475a; }
-.day.active { background: rgba(137, 180, 250, 0.15); border-color: #89b4fa; color: #89b4fa; font-weight: bold; transform: scale(1.05); }
-.dots { margin-top: 4px; height: 6px; }
-.dot { display: inline-block; width: 6px; height: 6px; border-radius: 50%; background: #a6e3a1; box-shadow: 0 0 5px #a6e3a1; }
-.empty-state { flex: 1; display: flex; align-items: center; justify-content: center; color: #6c7086; font-style: italic; }
-.log-list { list-style: none; padding: 0; margin-top: 20px; display: flex; flex-direction: column; gap: 12px; }
-.log-item { display: flex; justify-content: space-between; align-items: center; background: #1e1e2e; padding: 15px 20px; border-radius: 8px; border-left: 4px solid #89b4fa; }
-.log-info { display: flex; gap: 15px; align-items: center; }
-.log-id { color: #6c7086; font-family: monospace; }
-.log-title { color: #cdd6f4; font-weight: 500; font-size: 15px; }
-.status-badge { padding: 4px 10px; border-radius: 6px; font-size: 12px; font-weight: bold; }
-/* 🚨 弹窗专属样式 */
-.modal-overlay { 
-  position: absolute; top: 0; left: 0; right: 0; bottom: 0; 
-  background: rgba(17, 17, 27, 0.8); backdrop-filter: blur(4px);
-  display: flex; align-items: center; justify-content: center; z-index: 100; 
-}
-.modal-content { width: 400px; display: flex; flex-direction: column; gap: 20px; }
-.input-dark { 
-  background: #11111b; border: 1px solid #313244; color: #cdd6f4; 
-  padding: 12px 15px; border-radius: 8px; font-size: 15px; outline: none; 
-}
-.input-dark:focus { border-color: #89b4fa; }
-.modal-actions { display: flex; justify-content: flex-end; gap: 10px; }
-.btn-cancel { 
-  background: transparent; color: #a6adc8; border: 1px solid #45475a; 
-  padding: 10px 20px; border-radius: 8px; cursor: pointer; transition: 0.2s;
-}
-.btn-cancel:hover { background: #313244; color: #cdd6f4; }
+.eln-calendar-view { height: 100%; display: flex; flex-direction: column; padding: 20px; box-sizing: border-box; color: #cdd6f4;}
+.view-header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 20px; border-bottom: 1px solid #313244; padding-bottom: 15px; flex-shrink: 0;}
+.breadcrumbs { display: flex; gap: 10px; align-items: baseline;}
+.breadcrumbs h2 { margin: 0; font-size: 22px; color: #6c7086;}
+.breadcrumbs h2.active { color: #cba6f7; font-weight: bold;} 
+.btn-primary { background: #cba6f7; color: #11111b; border: none; padding: 10px 20px; border-radius: 8px; cursor: pointer; font-weight: bold; transition: 0.2s;}
+.btn-primary:hover { transform: translateY(-2px); box-shadow: 0 4px 12px rgba(203, 166, 247, 0.3); }
+.btn-outline { background: transparent; color: #cba6f7; border: 1px dashed #cba6f7; padding: 10px 20px; border-radius: 8px; cursor: pointer; font-weight: bold; transition: 0.2s; margin-right: 10px;}
+.btn-outline:hover { background: rgba(203, 166, 247, 0.1); }
+.btn-small { padding: 6px 12px; font-size: 12px; }
+
+.split-layout { display: flex; gap: 20px; flex: 1; min-height: 0;}
+.card { background: #181825; border: 1px solid #313244; border-radius: 12px;}
+
+.timeline-sidebar { flex: 1; max-width: 320px; display: flex; flex-direction: column; overflow: hidden; }
+.sidebar-header { padding: 20px; border-bottom: 1px solid #313244; display: flex; justify-content: space-between; align-items: center; background: #11111b; border-radius: 12px 12px 0 0;}
+.sidebar-header h3 { margin: 0; color: #cdd6f4; font-size: 16px;}
+.count-badge { background: #313244; color: #bac2de; padding: 2px 8px; border-radius: 12px; font-size: 12px;}
+.timeline-list { flex: 1; overflow-y: auto; padding: 15px;}
+.timeline-item { padding: 15px; border-left: 2px solid #313244; position: relative; cursor: pointer; transition: 0.2s; margin-left: 10px; margin-bottom: 15px;}
+.timeline-item:hover { background: #1e1e2e; border-radius: 0 8px 8px 0;}
+.timeline-item.active { background: rgba(203, 166, 247, 0.1); border-left-color: #cba6f7; border-radius: 0 8px 8px 0;}
+.timeline-date { font-size: 12px; color: #a6adc8; margin-bottom: 8px; position: relative;}
+.date-dot { position: absolute; width: 10px; height: 10px; background: #181825; border: 2px solid #6c7086; border-radius: 50%; left: -21px; top: 2px; transition: 0.2s;}
+.timeline-item.active .date-dot { border-color: #cba6f7; background: #cba6f7; box-shadow: 0 0 8px rgba(203, 166, 247, 0.5);}
+.log-title { margin: 0 0 5px 0; font-size: 14px; color: #cdd6f4; font-weight: bold;}
+.timeline-item.active .log-title { color: #cba6f7;}
+.log-preview { margin: 0 0 10px 0; font-size: 12px; color: #6c7086; line-height: 1.4;}
+.log-meta .tag { font-size: 10px; padding: 2px 6px; border-radius: 4px; background: #313244; color: #bac2de;}
+.log-meta .tag.warning { background: rgba(249, 226, 175, 0.15); color: #f9e2af;}
+.log-meta .tag.success { background: rgba(166, 227, 161, 0.15); color: #a6e3a1;}
+
+.editor-workspace { flex: 3; display: flex; flex-direction: column; overflow: hidden; background: #11111b;}
+.editor-empty { flex: 1; display: flex; flex-direction: column; align-items: center; justify-content: center; color: #bac2de;}
+.editor-container { flex: 1; display: flex; flex-direction: column; height: 100%; position: relative;}
+.editor-header { padding: 20px 30px; border-bottom: 1px dashed #313244; display: flex; justify-content: space-between; align-items: center; flex-shrink: 0;}
+.title-input { flex: 1; background: transparent; border: none; font-size: 24px; font-weight: bold; color: #cdd6f4; outline: none;}
+.title-input::placeholder { color: #45475a;}
+.editor-tools { display: flex; align-items: center; flex-shrink: 0;}
+.editor-body { flex: 1; position: relative; display: flex;}
+.markdown-textarea { flex: 1; width: 100%; padding: 30px; background: transparent; border: none; color: #bac2de; font-size: 15px; line-height: 1.8; font-family: 'Consolas', 'Courier New', monospace; outline: none; resize: none;}
+.markdown-textarea::placeholder { color: #45475a;}
+.editor-footer { padding: 15px 30px; border-top: 1px solid #313244; background: #181825; border-radius: 0 0 12px 12px; flex-shrink: 0;}
+.attachment-bar { display: flex; justify-content: space-between; align-items: center;}
+
+.mention-menu { position: absolute; width: 350px; background: #1e1e2e; border: 1px solid #cba6f7; box-shadow: 0 10px 30px rgba(0,0,0,0.5); z-index: 100; overflow: hidden;}
+.menu-header { padding: 10px 15px; background: #11111b; color: #cba6f7; font-size: 12px; font-weight: bold; border-bottom: 1px solid #313244;}
+.menu-list { max-height: 300px; overflow-y: auto;}
+.menu-item { display: flex; align-items: center; padding: 10px 15px; cursor: pointer; border-bottom: 1px dashed #313244; transition: 0.1s;}
+.menu-item:last-child { border-bottom: none;}
+.menu-item.selected { background: rgba(203, 166, 247, 0.15);}
+.item-icon { font-size: 24px; margin-right: 15px; background: #11111b; padding: 8px; border-radius: 8px;}
+.item-title { font-weight: bold; color: #cdd6f4; font-size: 14px; margin-bottom: 4px;}
+.item-desc { font-size: 11px; color: #a6adc8; white-space: nowrap; overflow: hidden; text-overflow: ellipsis;}
+.menu-empty { padding: 20px; text-align: center; color: #6c7086; font-size: 13px;}
+
+.empty-state { text-align: center; padding: 60px 20px;}
+.empty-icon { font-size: 48px; margin-bottom: 15px; opacity: 0.5;}
+.empty-text { color: #6c7086; font-size: 14px; font-weight: bold;}
+.fade-in { animation: fadeIn 0.3s ease; }
+@keyframes fadeIn { from { opacity: 0; transform: translateY(10px); } to { opacity: 1; transform: translateY(0); } }
 </style>
