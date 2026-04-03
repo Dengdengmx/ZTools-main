@@ -2,12 +2,12 @@
   <div class="global-dashboard-view fade-in">
     <div class="dashboard-header">
       <div class="greeting">
-        <h2>🔬 Mtools 实验室指挥中心</h2>
+        <h2>🔬 Mtools 核心工作台</h2>
         <p class="subtitle">全域物理资产与数字流转监控大盘 • {{ currentTime }}</p>
       </div>
       <div class="header-action">
         <button class="btn-spotlight" @click="openSpotlight">
-          🔍 唤起全宇宙检索 (⌘+K)
+          🔍 全局检索 (⌘+K)
         </button>
       </div>
     </div>
@@ -38,7 +38,7 @@
         <div class="stat-icon bg-default">🧬</div>
         <div class="stat-info">
           <span class="stat-value">{{ stats.plugins }}</span>
-          <span class="stat-label">就绪算力引擎</span>
+          <span class="stat-label">就绪计算脚本</span>
         </div>
       </div>
     </div>
@@ -52,19 +52,19 @@
         <div class="action-grid">
           <div class="action-btn" @click="$emit('navigate', 'sample')">
             <span class="a-icon">📥</span>
-            <span class="a-text">高通量入库</span>
+            <span class="a-text">样品入库</span>
           </div>
           <div class="action-btn" @click="$emit('navigate', 'eln')">
             <span class="a-icon">📝</span>
-            <span class="a-text">撰写新实验</span>
+            <span class="a-text">实验记录</span>
           </div>
           <div class="action-btn" @click="$emit('navigate', 'plugins')">
             <span class="a-icon">🚀</span>
-            <span class="a-text">启动 AI 设计</span>
+            <span class="a-text">启动脚本</span>
           </div>
           <div class="action-btn" @click="$emit('navigate', 'datahub')">
             <span class="a-icon">📊</span>
-            <span class="a-text">查阅图谱报告</span>
+            <span class="a-text">查看数据</span>
           </div>
         </div>
       </div>

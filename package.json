@@ -4,8 +4,6 @@
   "description": "MTools",
   "main": "./out/main/index.js",
   "author": "SciForge Lab",
-  
-  
   "license": "MIT",
   "scripts": {
     "format": "prettier --write .",
@@ -43,8 +41,11 @@
     "@electron/asar": "^4.1.0",
     "adm-zip": "^0.5.16",
     "chokidar": "^4.0.3",
+    "easymde": "^2.20.0",
     "electron-log": "^5.4.3",
     "fuse.js": "^7.0.0",
+    "html2pdf.js": "^0.14.0",
+    "jszip": "^3.10.1",
     "lmdb": "^3.4.4",
     "marked": "^17.0.1",
     "openai": "^6.25.0",

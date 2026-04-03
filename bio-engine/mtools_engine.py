@@ -4,6 +4,7 @@ import sys
 import subprocess
 import datetime
 from fastapi import FastAPI, Request
+from fastapi.concurrency import run_in_threadpool
 from pydantic import BaseModel
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
@@ -97,7 +98,7 @@ async def move_container(entry: ContainerMoveEntry):
     eq = sample_logic.equipments.get(entry.equip_id)
     if eq and entry.cid in eq.get("containers", {}):
         eq["containers"][entry.cid]["r"] = entry.r; eq["containers"][entry.cid]["c"] = entry.c
-        sample_logic.save_data()
+        await run_in_threadpool(sample_logic.save_data)
         return {"code": 200}
     return {"code": 400}
 
@@ -109,18 +110,22 @@ async def resize_container(entry: ContainerResizeEntry):
         new_rs = max(1, cont["rs"] + entry.d_row); new_cs = max(1, cont["cs"] + entry.d_col)
         if cont["r"] + new_rs <= eq["rows"] and cont["c"] + new_cs <= eq["cols"]:
             cont["rs"] = new_rs; cont["cs"] = new_cs
-            sample_logic.save_data(); return {"code": 200}
+            await run_in_threadpool(sample_logic.save_data)
+            return {"code": 200}
     return {"code": 400}
 
 @app.post("/api/samples/container/delete")
 async def delete_container(equip_id: str, cid: str):
-    success, msg = sample_logic.delete_container(equip_id, cid)
+    def perform_delete():
+        return sample_logic.delete_container(equip_id, cid)
+    success, msg = await run_in_threadpool(perform_delete)
     return {"code": 200 if success else 400, "message": msg}
 
 @app.post("/api/samples/add")
 async def add_sample(entry: SampleAddEntry):
     sample_info = {"id": f"SPL-{entry.well_index}", "name": entry.sample_name, "type": entry.sample_type, "vol": entry.vol, "unit": entry.unit, "ft": entry.ft_count, "owner": entry.owner, "notes": entry.notes, "x": entry.x, "y": entry.y, "deposit_time": datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")}
-    sample_logic.update_item(entry.box_id, entry.well_index, sample_info); return {"code": 200}
+    sample_logic.update_item(entry.box_id, entry.well_index, sample_info)
+    return {"code": 200}
 
 @app.post("/api/samples/bulk_add")
 async def bulk_add_samples(payload: BulkSampleAddEntry):
@@ -128,7 +133,8 @@ async def bulk_add_samples(payload: BulkSampleAddEntry):
     for entry in payload.samples:
         if payload.box_id not in sample_logic.items: sample_logic.items[payload.box_id] = {}
         sample_logic.items[payload.box_id][entry.well_index] = {"id": f"SPL-{entry.well_index}", "name": entry.sample_name, "type": entry.sample_type, "vol": entry.vol, "unit": entry.unit, "ft": entry.ft_count, "owner": entry.owner, "notes": entry.notes, "x": entry.x, "y": entry.y, "deposit_time": current_time}
-    sample_logic.save_data(); return {"code": 200}
+    await run_in_threadpool(sample_logic.save_data)
+    return {"code": 200}
 
 @app.post("/api/samples/checkout")
 async def checkout_sample(entry: SampleCheckoutEntry):
@@ -138,19 +144,24 @@ async def checkout_sample(entry: SampleCheckoutEntry):
         item["ft"] = int(item.get("ft", 0)) + 1
         log_str = f"[{datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] 👤{entry.operator} 取用 {entry.checkout_vol}{item.get('unit', 'μL')}。附言: {entry.notes}"
         item["notes"] = f"{log_str}\n{item.get('notes', '')}" if item.get("notes", "") else log_str
-        sample_logic.save_data(); return {"code": 200, "data": item}
+        await run_in_threadpool(sample_logic.save_data)
+        return {"code": 200, "data": item}
     return {"code": 404}
 
 @app.post("/api/samples/remove")
 async def remove_sample(box_id: str, well_index: str):
-    sample_logic.delete_item(box_id, well_index); return {"code": 200}
+    def perform_remove():
+        sample_logic.delete_item(box_id, well_index)
+    await run_in_threadpool(perform_remove)
+    return {"code": 200}
 
 @app.post("/api/samples/move_item")
 async def move_item(entry: ItemMoveEntry):
     if entry.box_id in sample_logic.items and entry.well_index in sample_logic.items[entry.box_id]:
         sample_logic.items[entry.box_id][entry.well_index]["x"] = entry.x
         sample_logic.items[entry.box_id][entry.well_index]["y"] = entry.y
-        sample_logic.save_data(); return {"code": 200}
+        await run_in_threadpool(sample_logic.save_data)
+        return {"code": 200}
     return {"code": 404}
 
 
@@ -162,14 +173,17 @@ class ElnSaveEntry(BaseModel): date: str; title: str; content: str
 @app.get("/api/eln/recent")
 async def get_eln_logs():
     logs = [{"title": t, "date": d, "status": "已记录"} for d, lst in eln_logic.schedule_data.items() if isinstance(lst, list) for t in lst]
-    logs.sort(key=lambda x: x["date"], reverse=True); return {"code": 200, "data": logs[:15]}
+    logs.sort(key=lambda x: x["date"], reverse=True)
+    return {"code": 200, "data": logs[:15]}
 
 @app.post("/api/eln/save")
 async def save_eln_log(entry: ElnSaveEntry):
     target_date = entry.date if entry.date else datetime.datetime.now().strftime("%Y-%m-%d")
     if target_date not in eln_logic.schedule_data: eln_logic.schedule_data[target_date] = []
     eln_logic.schedule_data[target_date].insert(0, f"{entry.title}\n{entry.content}")
-    eln_logic.save_data(); return {"code": 200}
+    # 防止大日志同步保存阻塞
+    await run_in_threadpool(eln_logic.save_data)
+    return {"code": 200}
 
 
 # ==========================================
@@ -180,7 +194,12 @@ class DataHubFileEntry(BaseModel): path: str; filename: str; content: str
 @app.get("/api/data/tree")
 async def get_data_tree(path: str = ""):
     base_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), "SciForge_Workspace", "SciForge_Data"))
-    target_dir = os.path.join(base_dir, path)
+    target_dir = os.path.abspath(os.path.join(base_dir, path))
+    
+    # 🚨 严格安全拦截：防止前端路径穿越 (如 ../../../Windows)
+    if not target_dir.startswith(base_dir):
+        return {"code": 403, "message": "非法的越权路径访问"}
+
     if not os.path.exists(target_dir):
         if path == "":
             for d in ["01_Sequences", "02_Structures", "03_Plugin_Outputs", "04_Reports"]: os.makedirs(os.path.join(base_dir, d), exist_ok=True)
@@ -202,26 +221,45 @@ async def get_data_tree(path: str = ""):
 @app.post("/api/data/save_file")
 async def save_data_file(entry: DataHubFileEntry):
     base_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), "SciForge_Workspace", "SciForge_Data"))
-    target_dir = os.path.join(base_dir, entry.path)
+    target_dir = os.path.abspath(os.path.join(base_dir, entry.path))
+    
+    # 🚨 严格安全拦截
+    if not target_dir.startswith(base_dir):
+         return {"code": 403, "message": "非法的越权路径访问"}
+         
     os.makedirs(target_dir, exist_ok=True)
-    with open(os.path.join(target_dir, entry.filename), "w", encoding="utf-8") as f: f.write(entry.content)
+    
+    def write_file():
+        with open(os.path.join(target_dir, entry.filename), "w", encoding="utf-8") as f: 
+            f.write(entry.content)
+            
+    # 防止大文件写入阻塞事件循环
+    await run_in_threadpool(write_file)
     return {"code": 200}
 
-# 🚨 新增：读取本地文件内容的接口
 @app.get("/api/data/read_file")
 async def read_data_file(path: str):
     base_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), "SciForge_Workspace", "SciForge_Data"))
-    target_file = os.path.join(base_dir, path)
+    target_file = os.path.abspath(os.path.join(base_dir, path))
+    
+    # 🚨 严格安全拦截
+    if not target_file.startswith(base_dir):
+        return {"code": 403, "message": "非法的越权路径访问"}
+        
     if not os.path.exists(target_file) or not os.path.isfile(target_file):
         return {"code": 404, "message": "文件不存在"}
+        
     try:
         # 只允许读取文本文件，如果是图片等二进制文件返回提示
         ext = os.path.splitext(target_file)[1].lower()
         if ext in ['.png', '.jpg', '.jpeg', '.pdf', '.zip']:
             return {"code": 400, "message": "二进制/图片文件暂不支持纯文本预览，请调用系统默认程序打开。"}
         
-        with open(target_file, "r", encoding="utf-8") as f:
-            content = f.read()
+        def read_content():
+            with open(target_file, "r", encoding="utf-8") as f:
+                return f.read()
+                
+        content = await run_in_threadpool(read_content)
         return {"code": 200, "data": content}
     except Exception as e:
         return {"code": 500, "message": str(e)}
@@ -245,8 +283,6 @@ def get_real_plugins():
             plugin_id = filename.replace("plugin_", "").replace(".py", "")
             script_path = os.path.join(plugins_dir, filename)
             
-            # 这里我们提供一个默认的配置骨架。
-            # 如果你的原生插件有特定的 Config 类，也可以在这里通过 importlib 动态提取
             plugin_info = {
                 "id": plugin_id,
                 "name": f"{plugin_id.capitalize()} 算法",
@@ -278,8 +314,7 @@ async def get_plugins():
 @app.get("/api/run/{plugin_id}")
 async def run_plugin(plugin_id: str, request: Request):
     """
-    🚨 核心引擎：使用 asyncio 子进程调用真实的 Python 脚本，
-    并将标准输出 (stdout) 实时截获，推送到前端终端！
+    🚨 核心引擎：使用 asyncio 子进程调用真实的 Python 脚本
     """
     async def event_generator():
         yield f"data: [System] 正在初始化本地算力节点...\n\n"
@@ -287,63 +322,82 @@ async def run_plugin(plugin_id: str, request: Request):
         # 1. 提取前端发来的表单参数
         params = dict(request.query_params)
         script_name = f"plugin_{plugin_id}.py"
-        script_path = os.path.join(os.path.dirname(__file__), "plugins", script_name)
+        plugins_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), "plugins"))
+        script_path = os.path.abspath(os.path.join(plugins_dir, script_name))
         
-        if not os.path.exists(script_path):
-            yield f"data: ❌ 致命错误: 物理硬盘中未找到算法脚本: {script_name}\n\n"
+        # 路径安全防护，防止 plugin_id 传入 "../../"
+        if not script_path.startswith(plugins_dir) or not os.path.exists(script_path):
+            yield f"data: ❌ 致命错误: 物理硬盘中未找到算法脚本: {script_name} 或路径非法\n\n"
             yield "data: [End] DONE\n\n"
             return
             
-        # 2. 组装控制台运行命令 (例如: python plugins/plugin_af3.py --iterations 100)
+        # 2. 🚨 修复参数 Boolean 误判 Bug
         cmd = [sys.executable, script_path]
         for key, value in params.items():
-            # 过滤掉布尔值为 false 的选项
             if value.lower() == 'false':
                 continue
-            cmd.append(f"--{key}")
-            if value.lower() != 'true':  # 如果不是布尔开关，则带上参数值
-                cmd.append(str(value))
+            elif value.lower() == 'true':
+                cmd.append(f"--{key}") # 布尔真：仅添加 flag 开关
+            else:
+                cmd.append(f"--{key}")
+                cmd.append(str(value)) # 其他类型：添加 flag 与值
                 
         cmd_str = " ".join(cmd)
         yield f"data: [Info] 执行原生底层命令: {cmd_str}\n\n"
         await asyncio.sleep(0.5)
         
+        process = None
         try:
-            # 3. 🚨 启动异步子进程，不阻塞主线程
+            # 3. 启动异步子进程
             process = await asyncio.create_subprocess_exec(
                 *cmd,
                 stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.STDOUT, # 将错误流重定向到标准输出一并捕获
-                cwd=os.path.dirname(__file__) # 设置工作目录
+                stderr=asyncio.subprocess.STDOUT, 
+                cwd=os.path.dirname(__file__) 
             )
             
-            # 4. 实时循环读取进程输出，推给前端 SSE
+            # 4. 🚨 修复僵尸进程 Bug：加入超时轮询与客户端断开检测
             while True:
-                line = await process.stdout.readline()
-                if not line:
-                    break # 进程结束，无更多输出
+                if await request.is_disconnected():
+                    # 客户端刷新或离开页面，立刻强杀进程
+                    process.terminate()
+                    break
                     
-                # 解码并在前端终端打出
+                try:
+                    # 使用 wait_for 防止 readline 永久阻塞导致断开检测失效
+                    line = await asyncio.wait_for(process.stdout.readline(), timeout=1.0)
+                except asyncio.TimeoutError:
+                    continue # 超时说明此时无日志输出，继续下一次循环重新检测断开
+                    
+                if not line:
+                    break # 进程自然结束，无更多输出
+                    
                 decoded_line = line.decode('utf-8', errors='replace').strip()
                 if decoded_line:
-                    # 简单判断是否包含 error 关键字以便前端染红
                     if "error" in decoded_line.lower() or "exception" in decoded_line.lower():
                         yield f"data: ❌ {decoded_line}\n\n"
                     else:
                         yield f"data: 👉 {decoded_line}\n\n"
                         
-            # 等待进程彻底收尾
-            await process.wait()
-            
-            if process.returncode == 0:
-                yield f"data: [Success] 🎉 进程 {script_name} 运行圆满结束！\n\n"
-            else:
-                yield f"data: ❌ [Error] 进程异常退出，退出码 (Return Code): {process.returncode}\n\n"
+            if not await request.is_disconnected():
+                await process.wait()
+                if process.returncode == 0:
+                    yield f"data: [Success] 🎉 进程 {script_name} 运行圆满结束！\n\n"
+                    # 下发真实文件标记给前端
+                    yield f"data: [OutputFile] {plugin_id}_output.pdb\n\n"
+                else:
+                    yield f"data: ❌ [Error] 进程异常退出，退出码 (Return Code): {process.returncode}\n\n"
                 
         except Exception as e:
             yield f"data: ❌ [Fatal] 无法拉起子进程: {str(e)}\n\n"
+        finally:
+            # 托底清理：防止任何异常下进程逃逸
+            if process and process.returncode is None:
+                try:
+                    process.terminate()
+                except Exception:
+                    pass
 
-        # 通知前端关闭通信流
         yield "data: [End] DONE\n\n"
 
     return StreamingResponse(event_generator(), media_type="text/event-stream")
@@ -351,4 +405,6 @@ async def run_plugin(plugin_id: str, request: Request):
 
 if __name__ == "__main__":
     print("🚀 Mtools BioEngine Backend 启动中...")
-    uvicorn.run(app, host="127.0.0.1", port=8080)
+    # 动态获取环境变量配置的端口，默认降级到 8080，避免被硬卡死
+    port = int(os.getenv("MTOOLS_PORT", 8080))
+    uvicorn.run(app, host="127.0.0.1", port=port)

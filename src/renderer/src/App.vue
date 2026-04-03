@@ -122,8 +122,8 @@
           @close-plugin="handleClosePlugin"
         />
         
-        <div class="mtools-entry-btn" @click="toggleDashboard(true)" title="展开 Mtools 工作站">
-          🧬 实验室
+        <div class="mtools-entry-btn" @click="toggleDashboard(true)" title="一键进入工作站 (Cmd/Ctrl + Enter)">
+          🧬 实验室 <span class="cmd-hint">⌘↵</span>
         </div>
       </div>
 
@@ -398,6 +398,25 @@ watch(currentView, (newView) => { if (newView !== ViewMode.Plugin) updateWindowH
 async function handleKeydown(event: KeyboardEvent): Promise<void> {
   if (isComposing.value) return
 
+  // 🚨 修复防线 1：如果在工作站模式下敲击回车，且焦点在输入框/文本域内，立刻阻断冒泡！
+  if (isDashboardMode.value && event.key === 'Enter') {
+    const target = event.target as HTMLElement;
+    const isInput = target.tagName === 'INPUT' || target.tagName === 'TEXTAREA' || target.isContentEditable;
+    if (isInput) {
+      return; // 直接放行，让输入框自然处理回车，绝不允许再往下执行全局事件
+    }
+  }
+
+  // 🚨 新增功能：快捷键秒进工作站 (Cmd/Ctrl + Enter)
+  if (event.key === 'Enter' && (event.metaKey || event.ctrlKey)) {
+    event.preventDefault()
+    if (!isDashboardMode.value) {
+      showSpotlight.value = false // 关掉聚光灯（如果开启的话）
+      toggleDashboard(true)
+    }
+    return
+  }
+
   // 🚨 Spotlight 唤醒拦截 (Cmd+K 或 Ctrl+K)
   if ((event.key === 'k' || event.key === 'K') && (event.metaKey || event.ctrlKey)) {
     event.preventDefault()
@@ -452,6 +471,13 @@ async function handleKeydown(event: KeyboardEvent): Promise<void> {
     else if (pastedImageData.value || pastedFilesData.value || pastedTextData.value) { pastedImageData.value = null; pastedFilesData.value = null; pastedTextData.value = null } 
     else { window.ztools.hideWindow() }
     return
+  }
+
+  // 🚨 修复防线 2：工作站模式下彻底切断底层穿透！
+  // 只要处于 Dashboard(工作站) 中，任何未被上面拦截的快捷键(上下左右、回车)，
+  // 都绝对不能传递给 SearchResults(底层的搜索列表)！
+  if (isDashboardMode.value) {
+    return;
   }
 
   if (currentView.value !== ViewMode.Search) return
@@ -734,6 +760,15 @@ onUnmounted(() => {
 }
 .mtools-entry-btn:hover { background: #89b4fa; color: #11111b; transform: translateY(-1px); }
 
+/* 🚨 快捷键视觉提示 */
+.cmd-hint {
+  opacity: 0.6;
+  font-size: 11px;
+  margin-left: 4px;
+  font-family: monospace;
+  font-weight: normal;
+}
+
 .mtools-dashboard { display: flex; height: 100vh; background: #11111b; color: #cdd6f4; border-radius: 8px; overflow: hidden; }
 .sidebar { width: 200px; background: #181825; border-right: 1px solid #313244; display: flex; flex-direction: column; padding: 20px 0; -webkit-app-region: drag; transition: width 0.3s cubic-bezier(0.4, 0, 0.2, 1); overflow: hidden; white-space: nowrap; }
 .sidebar.collapsed { width: 68px; }
@@ -757,4 +792,4 @@ onUnmounted(() => {
 .btn-outline:hover { background: rgba(137, 180, 250, 0.1); }
 .fade-in { animation: fadeIn 0.2s ease-out; }
 @keyframes fadeIn { from { opacity: 0; transform: scale(0.98); } to { opacity: 1; transform: scale(1); } }
-</style>z
+</style>
