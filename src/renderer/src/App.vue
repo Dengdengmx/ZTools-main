@@ -47,6 +47,7 @@
         </div>
       </div>
     </div>
+    
     <div v-if="isDashboardMode" class="mtools-dashboard fade-in">
       <aside class="sidebar" :class="{ 'collapsed': isSidebarCollapsed }">
         <div class="logo" @click="toggleSidebar" title="点击展开/收缩侧边栏">
@@ -82,11 +83,22 @@
             <span class="icon">🔍</span>
             <span class="text" v-show="!isSidebarCollapsed">全局检索 (⌘+K)</span>
           </div>
-          <div class="nav-item" :class="{ 'pinned-active': isPinned }" @click="togglePin">
+
+          <div class="nav-item" :class="{ 'pinned-active': isPinned }" @click="togglePin" title="固定窗口不隐藏" v-if="!isDetachedDashboard">
             <span class="icon">{{ isPinned ? '📌' : '📍' }}</span>
-            <span class="text" v-show="!isSidebarCollapsed">{{ isPinned ? '已固定 (常驻)' : '点击固定窗口' }}</span>
+            <span class="text" v-show="!isSidebarCollapsed">{{ isPinned ? '已固定 (保留数据)' : '点击固定窗口' }}</span>
           </div>
-          <div class="nav-item" @click="toggleDashboard(false)">
+
+          <div class="nav-item" @click="openDetachedDashboard" title="独立弹出为新窗口 (Cmd+D / Ctrl+D)" v-if="!isDetachedDashboard">
+            <span class="icon">⏏️</span>
+            <span class="text" v-show="!isSidebarCollapsed">独立弹出 (⌘+D)</span>
+          </div>
+          <div class="nav-item" @click="closeDetachedDashboard" title="关闭窗口" v-else>
+            <span class="icon">❌</span>
+            <span class="text" v-show="!isSidebarCollapsed">关闭工作站</span>
+          </div>
+
+          <div class="nav-item" @click="toggleDashboard(false)" v-if="!isDetachedDashboard">
             <span class="icon">🚪</span>
             <span class="text" v-show="!isSidebarCollapsed">返回极速框 (Esc)</span>
           </div>
@@ -107,7 +119,7 @@
       </main>
     </div>
 
-    <div v-show="!isDashboardMode" class="search-window">
+    <div v-show="!isDashboardMode && !isDetachedDashboard" class="search-window">
       <div :class="['search-box-wrapper', { 'with-divider': currentView === ViewMode.Plugin }]">
         <SearchBox
           ref="searchBoxRef"
@@ -185,16 +197,38 @@ const pastedImageData = ref<string | null>(null)
 const pastedFilesData = ref<FileItem[] | null>(null)
 const pastedTextData = ref<string | null>(null)
 
-// Mtools 工作站模式开关与侧边栏状态
-const isDashboardMode = ref(false)
+// ==============================================================
+// 🚨 Mtools 工作站模式开关与独立窗口逻辑
+// ==============================================================
+// 🚨 核心修复：直接使用 window.location.href 强匹配，抛弃容易丢弃 hash 后面参数的 URLSearchParams，直接从源头渲染出页面！
+const isDetachedDashboard = ref(window.location.href.includes('mode=dashboard'))
+const isDashboardMode = ref(window.location.href.includes('mode=dashboard'))
+
 const currentDashboardTab = ref('dashboard')
 const isSidebarCollapsed = ref(false)
 const isPinned = ref(false)
 
 function toggleSidebar() { isSidebarCollapsed.value = !isSidebarCollapsed.value }
+
+// 🌟 恢复的 togglePin 函数
 function togglePin() {
   isPinned.value = !isPinned.value
-  window.ztools.setWindowPinned(isPinned.value) 
+  if (window.ztools && window.ztools.setWindowPinned) {
+    window.ztools.setWindowPinned(isPinned.value)
+  }
+}
+
+const openDetachedDashboard = () => {
+    if (window.ztools && (window.ztools as any).openDashboardWindow) {
+        (window.ztools as any).openDashboardWindow()
+        toggleDashboard(false) // 在本窗口关闭工作站，将舞台让给刚弹出的独立工作站
+    } else {
+        alert("⚠️ 缺少底层接口：请确保已修改主进程文件 (preload/index.ts 与 window.ts)。")
+    }
+}
+
+const closeDetachedDashboard = () => {
+    window.close()
 }
 
 function toggleDashboard(show: boolean) {
@@ -202,7 +236,10 @@ function toggleDashboard(show: boolean) {
   if (show) {
     nextTick(() => { window.ztools.resizeWindow(800) })
   } else {
-    if (isPinned.value) togglePin()
+    // 退出工作站时如果已经固定，自动解开固定状态
+    if (isPinned.value) {
+      togglePin()
+    }
     updateWindowHeight()
     nextTick(() => { searchBoxRef.value?.focus() })
   }
@@ -264,26 +301,19 @@ const handleSpotlightKeydown = (e: KeyboardEvent) => {
     }
   } else if (e.key === 'Escape') {
     e.preventDefault()
-    e.stopPropagation() // 🚨 核心修复：阻止事件继续向上冒泡给全局 Window！
+    e.stopPropagation() 
     showSpotlight.value = false
   }
 }
 
 const selectSpotlightItem = (item: any) => {
   showSpotlight.value = false
-  // 确保母舰展开
   if (!isDashboardMode.value) toggleDashboard(true)
   
-  // 智能路由到对应模块
-  if (item.module === 'SampleHub') {
-    currentDashboardTab.value = 'sample'
-  } else if (item.module === 'DataHub') {
-    currentDashboardTab.value = 'datahub'
-  } else if (item.module === 'ELN') {
-    currentDashboardTab.value = 'eln'
-  }
+  if (item.module === 'SampleHub') { currentDashboardTab.value = 'sample' } 
+  else if (item.module === 'DataHub') { currentDashboardTab.value = 'datahub' } 
+  else if (item.module === 'ELN') { currentDashboardTab.value = 'eln' }
   
-  // 发送全局总线事件，子组件内部如果需要解析路径可以监听此事件（例如直接跳到某个盒子）
   window.dispatchEvent(new CustomEvent('spotlight-nav-event', { detail: item }))
 }
 // ==============================================================
@@ -398,44 +428,46 @@ watch(currentView, (newView) => { if (newView !== ViewMode.Plugin) updateWindowH
 async function handleKeydown(event: KeyboardEvent): Promise<void> {
   if (isComposing.value) return
 
-  // 🚨 修复防线 1：如果在工作站模式下敲击回车，且焦点在输入框/文本域内，立刻阻断冒泡！
   if (isDashboardMode.value && event.key === 'Enter') {
     const target = event.target as HTMLElement;
     const isInput = target.tagName === 'INPUT' || target.tagName === 'TEXTAREA' || target.isContentEditable;
-    if (isInput) {
-      return; // 直接放行，让输入框自然处理回车，绝不允许再往下执行全局事件
-    }
+    if (isInput) return;
   }
 
-  // 🚨 新增功能：快捷键秒进工作站 (Cmd/Ctrl + Enter)
   if (event.key === 'Enter' && (event.metaKey || event.ctrlKey)) {
     event.preventDefault()
     if (!isDashboardMode.value) {
-      showSpotlight.value = false // 关掉聚光灯（如果开启的话）
+      showSpotlight.value = false 
       toggleDashboard(true)
     }
     return
   }
 
-  // 🚨 Spotlight 唤醒拦截 (Cmd+K 或 Ctrl+K)
   if ((event.key === 'k' || event.key === 'K') && (event.metaKey || event.ctrlKey)) {
     event.preventDefault()
     toggleSpotlight(true)
     return
   }
 
-  // 🚨 如果 Spotlight 正在显示，除了上面的 K 键，屏蔽其他主框架快捷键干扰
   if (showSpotlight.value) {
     if (event.key === 'Escape') {
       event.preventDefault()
-      event.stopPropagation() // 🚨 核心修复：双重保险，阻止冒泡
+      event.stopPropagation()
       showSpotlight.value = false
     }
-    return // 退出继续执行，把焦点锁死在 Spotlight 内部
+    return 
   }
 
+  // 🚨 核心修复：分离拦截！
   if ((event.key === 'd' || event.key === 'D') && (event.metaKey || event.ctrlKey)) {
-    event.preventDefault(); if (currentView.value === ViewMode.Plugin && windowStore.currentPlugin) detachCurrentPlugin(); return
+    event.preventDefault(); 
+    if (currentView.value === ViewMode.Plugin && windowStore.currentPlugin) {
+      detachCurrentPlugin(); 
+    } 
+    else if (isDashboardMode.value && !isDetachedDashboard.value) {
+      openDetachedDashboard();
+    }
+    return
   }
 
   if ((event.key === 'q' || event.key === 'Q') && (event.metaKey || event.ctrlKey)) {
@@ -465,6 +497,7 @@ async function handleKeydown(event: KeyboardEvent): Promise<void> {
 
   if (event.key === 'Escape') {
     event.preventDefault()
+    if (isDetachedDashboard.value) return; // 💡 独立工作站下屏蔽 Esc，防止误触关闭
     if (isDashboardMode.value) { toggleDashboard(false); return }
     if (currentView.value === ViewMode.Plugin) { handlePluginStepExit(); return }
     if (searchQuery.value.trim()) { searchQuery.value = '' } 
@@ -473,19 +506,18 @@ async function handleKeydown(event: KeyboardEvent): Promise<void> {
     return
   }
 
-  // 🚨 修复防线 2：工作站模式下彻底切断底层穿透！
-  // 只要处于 Dashboard(工作站) 中，任何未被上面拦截的快捷键(上下左右、回车)，
-  // 都绝对不能传递给 SearchResults(底层的搜索列表)！
-  if (isDashboardMode.value) {
-    return;
-  }
+  if (isDashboardMode.value) return;
 
   if (currentView.value !== ViewMode.Search) return
   searchResultsRef.value?.handleKeydown(event)
 }
 
 onMounted(async () => {
-  // 🚨 允许子组件抛出全局事件唤醒 Spotlight
+  // 💡 如果是独立弹出的窗口，默认进入 Dashboard 模式
+  if (isDetachedDashboard.value) {
+      isDashboardMode.value = true
+  }
+
   window.addEventListener('open-spotlight', () => toggleSpotlight(true))
 
   await Promise.all([windowStore.loadSettings(), commandDataStore.initializeData()])
@@ -599,175 +631,43 @@ onUnmounted(() => {
 
 <style scoped>
 /* ================= 🚨 Spotlight 专属全局样式 ================= */
-.spotlight-overlay {
-  position: fixed;
-  top: 0; left: 0;
-  width: 100vw; height: 100vh;
-  background: rgba(17, 17, 27, 0.75);
-  backdrop-filter: blur(10px);
-  display: flex;
-  justify-content: center;
-  align-items: flex-start;
-  padding-top: 15vh;
-  z-index: 99999;
-}
-.spotlight-modal {
-  width: 650px;
-  background: #181825;
-  border: 1px solid #45475a;
-  border-radius: 12px;
-  box-shadow: 0 30px 60px rgba(0,0,0,0.6);
-  display: flex;
-  flex-direction: column;
-  overflow: hidden;
-}
-.spotlight-input-wrapper {
-  display: flex;
-  align-items: center;
-  padding: 20px 25px;
-  border-bottom: 1px solid #313244;
-  background: #11111b;
-}
-.spotlight-icon {
-  font-size: 24px;
-  margin-right: 15px;
-  opacity: 0.8;
-}
-.spotlight-input {
-  flex: 1;
-  background: transparent;
-  border: none;
-  outline: none;
-  color: #cdd6f4;
-  font-size: 22px;
-  font-weight: 500;
-  font-family: inherit;
-}
+.spotlight-overlay { position: fixed; top: 0; left: 0; width: 100vw; height: 100vh; background: rgba(17, 17, 27, 0.75); backdrop-filter: blur(10px); display: flex; justify-content: center; align-items: flex-start; padding-top: 15vh; z-index: 99999; }
+.spotlight-modal { width: 650px; background: #181825; border: 1px solid #45475a; border-radius: 12px; box-shadow: 0 30px 60px rgba(0,0,0,0.6); display: flex; flex-direction: column; overflow: hidden; }
+.spotlight-input-wrapper { display: flex; align-items: center; padding: 20px 25px; border-bottom: 1px solid #313244; background: #11111b; }
+.spotlight-icon { font-size: 24px; margin-right: 15px; opacity: 0.8; }
+.spotlight-input { flex: 1; background: transparent; border: none; outline: none; color: #cdd6f4; font-size: 22px; font-weight: 500; font-family: inherit; }
 .spotlight-input::placeholder { color: #6c7086; }
-.esc-hint {
-  font-size: 12px;
-  color: #6c7086;
-  background: #313244;
-  padding: 4px 8px;
-  border-radius: 6px;
-  font-weight: bold;
-}
-.spotlight-results {
-  max-height: 400px;
-  overflow-y: auto;
-  padding: 10px;
-}
-.spotlight-item {
-  display: flex;
-  align-items: center;
-  padding: 15px 20px;
-  cursor: pointer;
-  border-radius: 8px;
-  border: 1px solid transparent;
-  transition: 0.1s;
-  margin-bottom: 5px;
-}
-.spotlight-item.active {
-  background: rgba(137, 180, 250, 0.1);
-  border-color: #89b4fa;
-}
-.spotlight-item-icon {
-  font-size: 24px;
-  margin-right: 15px;
-  background: #11111b;
-  border: 1px solid #313244;
-  padding: 8px;
-  border-radius: 8px;
-}
-.spotlight-item-info {
-  display: flex;
-  flex-direction: column;
-  flex: 1;
-  min-width: 0;
-}
-.spotlight-item-title {
-  color: #cdd6f4;
-  font-size: 16px;
-  font-weight: bold;
-  margin-bottom: 4px;
-}
-.spotlight-item-desc {
-  color: #a6adc8;
-  font-size: 12px;
-  white-space: nowrap;
-  overflow: hidden;
-  text-overflow: ellipsis;
-}
-.module-tag {
-  background: #313244;
-  color: #bac2de;
-  padding: 2px 6px;
-  border-radius: 4px;
-  font-size: 10px;
-  margin-right: 6px;
-}
-.spotlight-item-action {
-  font-size: 12px;
-  color: #89b4fa;
-  font-weight: bold;
-  opacity: 0;
-  transition: 0.2s;
-}
+.esc-hint { font-size: 12px; color: #6c7086; background: #313244; padding: 4px 8px; border-radius: 6px; font-weight: bold; }
+.spotlight-results { max-height: 400px; overflow-y: auto; padding: 10px; }
+.spotlight-item { display: flex; align-items: center; padding: 15px 20px; cursor: pointer; border-radius: 8px; border: 1px solid transparent; transition: 0.1s; margin-bottom: 5px; }
+.spotlight-item.active { background: rgba(137, 180, 250, 0.1); border-color: #89b4fa; }
+.spotlight-item-icon { font-size: 24px; margin-right: 15px; background: #11111b; border: 1px solid #313244; padding: 8px; border-radius: 8px; }
+.spotlight-item-info { display: flex; flex-direction: column; flex: 1; min-width: 0; }
+.spotlight-item-title { color: #cdd6f4; font-size: 16px; font-weight: bold; margin-bottom: 4px; }
+.spotlight-item-desc { color: #a6adc8; font-size: 12px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.module-tag { background: #313244; color: #bac2de; padding: 2px 6px; border-radius: 4px; font-size: 10px; margin-right: 6px; }
+.spotlight-item-action { font-size: 12px; color: #89b4fa; font-weight: bold; opacity: 0; transition: 0.2s; }
 .spotlight-item.active .spotlight-item-action { opacity: 1; }
-.spotlight-empty {
-  padding: 40px;
-  text-align: center;
-  color: #6c7086;
-  font-size: 14px;
-}
-.spotlight-footer {
-  padding: 12px 20px;
-  background: #11111b;
-  border-top: 1px solid #313244;
-  display: flex;
-  justify-content: flex-end;
-  gap: 15px;
-  color: #6c7086;
-  font-size: 12px;
-}
-.key-hint {
-  background: #313244;
-  padding: 2px 6px;
-  border-radius: 4px;
-  color: #cdd6f4;
-  font-weight: bold;
-  font-family: monospace;
-}
+.spotlight-empty { padding: 40px; text-align: center; color: #6c7086; font-size: 14px; }
+.spotlight-footer { padding: 12px 20px; background: #11111b; border-top: 1px solid #313244; display: flex; justify-content: flex-end; gap: 15px; color: #6c7086; font-size: 12px; }
+.key-hint { background: #313244; padding: 2px 6px; border-radius: 4px; color: #cdd6f4; font-weight: bold; font-family: monospace; }
 .spin-loader { display: inline-block; animation: spin 2s linear infinite; }
 @keyframes spin { 100% { transform: rotate(360deg); } }
 .fade-in-scale { animation: fadeInScale 0.2s cubic-bezier(0.175, 0.885, 0.32, 1.275); }
 @keyframes fadeInScale { from { opacity: 0; transform: scale(0.95); } to { opacity: 1; transform: scale(1); } }
 /* ============================================================== */
 
-.pinned-active {
-  color: #a6e3a1 !important; 
-  font-weight: bold;
-  background: rgba(166, 227, 161, 0.1) !important;
-}
+.pinned-active { color: #a6e3a1 !important; font-weight: bold; background: rgba(166, 227, 161, 0.1) !important; }
 .app-container { width: 100%; display: flex; flex-direction: column; outline: none; overflow: hidden; border-radius: 8px; }
 .app-container__plugin { border-radius: 0; }
 .search-window { width: 100%; height: 100%; display: flex; flex-direction: column; }
 .search-box-wrapper { flex-shrink: 0; }
 .plugin-placeholder { flex: 1; background: transparent; -webkit-app-region: no-drag; user-select: none; }
 
-.mtools-entry-btn {
-  position: absolute; right: 65px; top: 14px; background: #181825; border: 1px solid #313244; color: #89b4fa; padding: 6px 12px; border-radius: 6px; cursor: pointer; font-weight: bold; z-index: 100; transition: all 0.2s ease; font-size: 13px; box-shadow: 0 2px 5px rgba(0,0,0,0.2);
-}
+.mtools-entry-btn { position: absolute; right: 65px; top: 14px; background: #181825; border: 1px solid #313244; color: #89b4fa; padding: 6px 12px; border-radius: 6px; cursor: pointer; font-weight: bold; z-index: 100; transition: all 0.2s ease; font-size: 13px; box-shadow: 0 2px 5px rgba(0,0,0,0.2); }
 .mtools-entry-btn:hover { background: #89b4fa; color: #11111b; transform: translateY(-1px); }
 
-/* 🚨 快捷键视觉提示 */
-.cmd-hint {
-  opacity: 0.6;
-  font-size: 11px;
-  margin-left: 4px;
-  font-family: monospace;
-  font-weight: normal;
-}
+.cmd-hint { opacity: 0.6; font-size: 11px; margin-left: 4px; font-family: monospace; font-weight: normal; }
 
 .mtools-dashboard { display: flex; height: 100vh; background: #11111b; color: #cdd6f4; border-radius: 8px; overflow: hidden; }
 .sidebar { width: 200px; background: #181825; border-right: 1px solid #313244; display: flex; flex-direction: column; padding: 20px 0; -webkit-app-region: drag; transition: width 0.3s cubic-bezier(0.4, 0, 0.2, 1); overflow: hidden; white-space: nowrap; }

@@ -1,893 +1,396 @@
 # plugins/plugin_akta.py
-"""
-AKTA 层析分析插件
-提供 AKTA 数据的可视化与拟合功能，支持工作台交互和后台自动处理。
-"""
-
 import os
-# 【新增】：强制声明使用 PyQt5，防止 Matplotlib 擅自调用 PySide6 导致类型冲突
-os.environ["QT_API"] = "pyqt5" 
-import matplotlib
-matplotlib.use('Qt5Agg') 
+import sys
+import argparse
 import json
 import pandas as pd
 import numpy as np
+from io import StringIO
+import matplotlib
+matplotlib.use('Agg') 
+import matplotlib.pyplot as plt
 from matplotlib.ticker import AutoMinorLocator, MultipleLocator, MaxNLocator, NullLocator
-from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg as FigureCanvas
-from matplotlib.backends.backend_qt5agg import NavigationToolbar2QT as NavigationToolbar
-from matplotlib.figure import Figure
 
-from PyQt5.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QDialog, QScrollArea,
-                             QMessageBox, QFileDialog, QSplitter, QSizePolicy)
-from PyQt5.QtCore import Qt
+trapz_func = getattr(np, 'trapezoid', np.trapz)
 
-from qfluentwidgets import (LineEdit, SpinBox, DoubleSpinBox, CheckBox, ComboBox,
-                            BodyLabel, PushButton, PrimaryPushButton,
-                            StrongBodyLabel, CardWidget, ListWidget, FluentIcon as FIF)
+PLUGIN_NAME = "AKTA 层析智能分析"
+PLUGIN_ICON = "⚗️"
+PLUGIN_DESC = "自动识别 UNICORN 复杂表头，支持收集管(Fraction)贴底映射、靶向回收管无缝高亮与积分。"
 
-from core.plugin_manager import BasePlugin
-from core.ui_base import BasePluginUI
-from core.config import GlobalConfig
+UI_SCHEMA = [
+    {"key": "file_path", "label": "📁 选择本地层析数据 (.csv/.txt/.xlsx)", "type": "file", "span": 12},
+    
+    {"key": "auto_col", "label": "🤖 开启智能表头嗅探 (勾选此项将无视下方【手动】列号)", "type": "boolean", "default": True, "span": 12},
+    {"key": "c1_name", "label": "[自动] 主波长特征", "type": "string", "default": "280", "span": 4},
+    {"key": "c2_name", "label": "[自动] 次波长特征", "type": "string", "default": "260", "span": 4},
+    {"key": "frac_name", "label": "[自动] 收集管特征", "type": "string", "default": "Fraction", "span": 4},
 
+    {"key": "c1x", "label": "[手动] 主波X列", "type": "number", "default": 0, "span": 3},
+    {"key": "c1y", "label": "[手动] 主波Y列", "type": "number", "default": 1, "span": 3},
+    {"key": "c2x", "label": "[手动] 次波X列", "type": "number", "default": 2, "span": 3},
+    {"key": "c2y", "label": "[手动] 次波Y列", "type": "number", "default": 3, "span": 3},
 
-# ==========================================
-# 核心算法区 (原生算法，保持纯净)
-# ==========================================
-def safe_load_array(filepath, skiprows=0):
-    """安全加载数值数组，支持 CSV/Excel 等多种格式"""
-    if filepath.lower().endswith(('.xlsx', '.xls')):
-        df = pd.read_excel(filepath, header=None, skiprows=skiprows, engine='openpyxl')
-        return df.apply(pd.to_numeric, errors='coerce').values
+    {"key": "show_frac", "label": "🧪 底部绘制收集管刻度", "type": "boolean", "default": True, "span": 5},
+    {"key": "target_fracs", "label": "🎯 积分并高亮回收管 (例: 15-19, B2)", "type": "string", "default": "", "span": 7},
 
-    for enc in ["utf-8-sig", "utf-8", "utf-16", "gbk", "latin1"]:
-        try:
-            with open(filepath, "r", encoding=enc) as f:
-                content = f.readlines()
+    {"key": "title", "label": "图表主标题", "type": "string", "default": "AKTA Chromatography", "span": 12},
+    {"key": "xl", "label": "X 轴标签", "type": "string", "default": "Elution volume (mL)", "span": 6},
+    {"key": "yl", "label": "Y 轴标签", "type": "string", "default": "Absorbance (mAU)", "span": 6},
+    
+    {"key": "x1", "label": "X起点(留空自动)", "type": "string", "default": "", "span": 3},
+    {"key": "x2", "label": "X终点(留空自动)", "type": "string", "default": "", "span": 3},
+    {"key": "y1", "label": "Y起点(留空自动)", "type": "string", "default": "", "span": 3},
+    {"key": "y2", "label": "Y终点(留空自动)", "type": "string", "default": "", "span": 3},
+
+    {"key": "xt_step", "label": "X主间隔", "type": "number", "default": 0, "span": 3},
+    {"key": "xt_n", "label": "X主刻度数", "type": "number", "default": 0, "span": 3},
+    {"key": "yt_step", "label": "Y主间隔", "type": "number", "default": 0, "span": 3},
+    {"key": "yt_n", "label": "Y主刻度数", "type": "number", "default": 0, "span": 3},
+    
+    {"key": "tk_len", "label": "刻度长", "type": "number", "default": 6, "span": 4},
+    {"key": "tk_dir", "label": "刻度朝向", "type": "select", "options": ["in", "out"], "default": "in", "span": 4},
+    {"key": "min_n", "label": "次级分段数", "type": "number", "default": 2, "span": 4},
+
+    {"key": "spin_w", "label": "画板宽(inch)", "type": "number", "default": 7.0, "span": 3},
+    {"key": "spin_h", "label": "画板高(inch)", "type": "number", "default": 5.0, "span": 3},
+    {"key": "fs", "label": "基础字号", "type": "number", "default": 12, "span": 3},
+    {"key": "lw", "label": "曲线线宽", "type": "number", "default": 1.5, "span": 3},
+    
+    {"key": "peak", "label": "自动寻主峰", "type": "boolean", "default": True, "span": 3},
+    {"key": "leg", "label": "显示图例", "type": "boolean", "default": True, "span": 3},
+    {"key": "grid", "label": "显示网格", "type": "boolean", "default": False, "span": 3},
+    {"key": "fmt", "label": "图表格式", "type": "select", "options": ["png", "pdf", "svg"], "default": "png", "span": 3},
+    
+    {"key": "b_title", "label": "加粗标题", "type": "boolean", "default": True, "span": 3},
+    {"key": "b_label", "label": "加粗轴名", "type": "boolean", "default": True, "span": 3},
+    {"key": "b_tick", "label": "加粗刻度", "type": "boolean", "default": False, "span": 3},
+    {"key": "b_leg", "label": "加粗图例", "type": "boolean", "default": False, "span": 3},
+    
+    {"key": "transparent", "label": "透明背景", "type": "boolean", "default": False, "span": 12}
+]
+
+UI_LAYOUT = {
+    "direction": "row",
+    "blocks": [
+        {"type": "form", "width": "420px", "height": "100%"},
+        {"type": "tabs", "flex": "1", "height": "100%", "panes": [
+            {"title": "👁️ 层析积分图", "type": "preview"},
+            {"title": "🎯 核心分析指标", "type": "metrics"},
+            {"title": "💻 算力引擎日志", "type": "terminal"},
+            {"title": "📤 多维归档输出", "type": "export"}
+        ]}
+    ]
+}
+
+def parse_unicorn_text(txt_content):
+    txt_content = txt_content.replace('\x00', '')
+    lines = txt_content.strip().split('\n')
+    raw_rows = []
+    for line in lines:
+        line = line.strip('\r\n').strip()
+        if not line: continue
+        parts = []
+        if '\t' in line: parts = line.split('\t')
+        elif ',' in line: parts = line.split(',')
+        elif ';' in line: parts = line.split(';')
+        else: parts = line.split()
+        raw_rows.append([p.strip() for p in parts])
+        
+    if not raw_rows: return pd.DataFrame()
+    def is_float(s):
+        try: float(s); return True
+        except: return False
+
+    data_start_idx = 0
+    for i, row in enumerate(raw_rows):
+        num_c = sum(1 for x in row if is_float(x))
+        if len(row) > 0 and num_c / len(row) > 0.4:
+            data_start_idx = i
             break
-        except:
-            continue
 
-    data_rows = []
-    max_cols = 0
-    for i, line in enumerate(content):
-        if i < skiprows:
-            continue
-        line = line.strip()
-        if not line:
-            continue
-
-        if '\t' in line:
-            parts = line.split('\t')
-        elif ',' in line:
-            parts = line.split(',')
-        elif ';' in line:
-            parts = line.split(';')
-        else:
-            parts = line.split()
-
-        row = []
-        for p in parts:
-            p = p.strip()
-            try:
-                row.append(float(p))
-            except ValueError:
-                row.append(np.nan)
-
-        if row and not all(np.isnan(x) for x in row):
-            data_rows.append(row)
-            max_cols = max(max_cols, len(row))
-
-    if not data_rows:
-        return np.array([])
-    return np.array([r + [np.nan] * (max_cols - len(r)) for r in data_rows], dtype=float)
-
-
-# ==========================================
-# 前端：工作台 UI
-# ==========================================
-class AktaUI(BasePluginUI):
-    """AKTA 分析工作台 UI"""
-
-    def __init__(self, parent=None, is_setting_mode=False):
-        super().__init__(plugin_id="akta_analyzer", plugin_name="AKTA 层析分析", parent=parent)
-        self.is_setting_mode = is_setting_mode
-        self.file_list = []
-        self.setAcceptDrops(True)
-        self._setup_ui()
-        self._load_config()
-
-    def _setup_ui(self):
-        """构建 UI 控件"""
-        # ========== 左侧参数面板 ==========
-        # 工具栏（导入/导出模板）
-        h_tools = QHBoxLayout()
-        btn_import_config = PushButton("📂 载入模板", icon=FIF.FOLDER)
-        btn_export_config = PushButton("💾 保存模板", icon=FIF.SAVE)
-        btn_import_config.clicked.connect(self.import_config)
-        btn_export_config.clicked.connect(self.export_config)
-        h_tools.addWidget(btn_import_config)
-        h_tools.addWidget(btn_export_config)
-        # 将工具栏添加到 param_layout 顶部（需要先获取 param_layout）
-        self.param_layout.insertLayout(0, h_tools)
-
-        # 1. 数据池（仅工作台模式）
-        if not self.is_setting_mode:
-            group_data, layout_data = self.create_group("1. 数据池 (支持拖拽/右键发送)")
-            btn_row = QHBoxLayout()
-            btn_add = PrimaryPushButton("导入...", icon=FIF.DOWNLOAD)
-            btn_add.clicked.connect(self.open_files)
-            btn_clear = PushButton("清空", icon=FIF.DELETE)
-            btn_clear.clicked.connect(self.clear_files)
-            btn_row.addWidget(btn_add)
-            btn_row.addWidget(btn_clear)
-            layout_data.addLayout(btn_row)
-
-            self.list_widget = ListWidget()
-            self.list_widget.setFixedHeight(65)
-            self.list_widget.itemClicked.connect(self.trigger_render)
-            layout_data.addWidget(self.list_widget)
-            self.add_param_widget(group_data)
-
-        # 2. 画板尺寸
-        group_wh, layout_wh = self.create_group("2. 全局画板尺寸 (英寸)")
-        h_wh = QHBoxLayout()
-        self.spin_w = DoubleSpinBox()
-        self.spin_w.setRange(1.0, 50.0)
-        self.spin_w.setValue(7.0)
-        self.spin_w.setSingleStep(0.5)
-        self.spin_h = DoubleSpinBox()
-        self.spin_h.setRange(1.0, 50.0)
-        self.spin_h.setValue(5.0)
-        self.spin_h.setSingleStep(0.5)
-        h_wh.addWidget(BodyLabel("W:"))
-        h_wh.addWidget(self.spin_w, 1)
-        h_wh.addSpacing(5)
-        h_wh.addWidget(BodyLabel("H:"))
-        h_wh.addWidget(self.spin_h, 1)
-        layout_wh.addLayout(h_wh)
-        self.add_param_widget(group_wh)
-
-        # 3. 专属参数配置（使用滚动区域）
-        group_param, layout_param = self.create_group("3. 专属参数配置")
-        self.add_param_widget(group_param)
-
-        scroll = QScrollArea()
-        scroll.setWidgetResizable(True)
-        scroll.setFrameShape(QScrollArea.NoFrame)
-        scroll.setStyleSheet("QScrollArea { background: transparent; }")
-        scroll_content = QWidget()
-        scroll_layout = QVBoxLayout(scroll_content)
-        scroll_layout.setContentsMargins(0, 0, 4, 0)
-        scroll_layout.setSpacing(2)
-
-        # ---- 曲线通道设置 ----
-        scroll_layout.addWidget(StrongBodyLabel("曲线通道设置"))
-        self.c1x = SpinBox()
-        self.c1x.setRange(0, 999)
-        self.c1x.setValue(0)
-        self.c1y = SpinBox()
-        self.c1y.setRange(0, 999)
-        self.c1y.setValue(1)
-        self.l1 = LineEdit()
-        self.l1.setText("UV_280")
-        self.ls1 = ComboBox()
-        self.ls1.addItems(["-", "--", "-.", ":"])
-        h1 = QHBoxLayout()
-        h1.addWidget(BodyLabel("蓝线(X/Y):"))
-        h1.addWidget(self.c1x)
-        h1.addWidget(self.c1y)
-        h1.addWidget(BodyLabel("名:"))
-        h1.addWidget(self.l1, 1)
-        h1.addWidget(self.ls1)
-        scroll_layout.addLayout(h1)
-
-        self.c2x = SpinBox()
-        self.c2x.setRange(0, 999)
-        self.c2x.setValue(2)
-        self.c2y = SpinBox()
-        self.c2y.setRange(0, 999)
-        self.c2y.setValue(3)
-        self.l2 = LineEdit()
-        self.l2.setText("UV_260")
-        self.ls2 = ComboBox()
-        self.ls2.addItems(["-", "--", "-.", ":"])
-        h2 = QHBoxLayout()
-        h2.addWidget(BodyLabel("红线(X/Y):"))
-        h2.addWidget(self.c2x)
-        h2.addWidget(self.c2y)
-        h2.addWidget(BodyLabel("名:"))
-        h2.addWidget(self.l2, 1)
-        h2.addWidget(self.ls2)
-        scroll_layout.addLayout(h2)
-
-        scroll_layout.addSpacing(5)
-
-        # ---- 坐标轴与范围 ----
-        scroll_layout.addWidget(StrongBodyLabel("坐标轴与范围"))
-        self.title = LineEdit()
-        self.title.setText("AKTA Plot")
-        self.add_row(scroll_layout, "图表标题:", self.title)
-
-        self.xl = LineEdit()
-        self.xl.setText("Elution volume (mL)")
-        scroll_layout.addWidget(self.xl)
-
-        self.x1 = LineEdit()
-        self.x2 = LineEdit()
-        self.add_row(scroll_layout, "X范围 起:", self.x1, "止:", self.x2)
-
-        self.xt_step = LineEdit()
-        self.xt_n = LineEdit()
-        self.add_row(scroll_layout, "X主间隔:", self.xt_step, "主刻度数:", self.xt_n)
-
-        self.yl = LineEdit()
-        self.yl.setText("Absorbance (mAU)")
-        scroll_layout.addWidget(self.yl)
-
-        self.y1 = LineEdit()
-        self.y2 = LineEdit()
-        self.add_row(scroll_layout, "Y范围 起:", self.y1, "止:", self.y2)
-
-        self.yt_step = LineEdit()
-        self.yt_n = LineEdit()
-        self.add_row(scroll_layout, "Y主间隔:", self.yt_step, "主刻度数:", self.yt_n)
-
-        scroll_layout.addSpacing(5)
-
-        # ---- 外观与辅助刻度 ----
-        scroll_layout.addWidget(StrongBodyLabel("外观与辅助刻度"))
-        lbl_bold = BodyLabel("独立加粗控制:")
-        lbl_bold.setStyleSheet("color:#666; font-size:11px;")
-        scroll_layout.addWidget(lbl_bold)
-
-        h_bold = QHBoxLayout()
-        self.b_title = CheckBox("标题")
-        self.b_title.setChecked(True)
-        self.b_label = CheckBox("轴名")
-        self.b_label.setChecked(True)
-        self.b_tick = CheckBox("刻度")
-        self.b_leg = CheckBox("图例")
-        h_bold.addWidget(self.b_title)
-        h_bold.addWidget(self.b_label)
-        h_bold.addWidget(self.b_tick)
-        h_bold.addWidget(self.b_leg)
-        scroll_layout.addLayout(h_bold)
-
-        self.lw = DoubleSpinBox()
-        self.lw.setRange(0.5, 10.0)
-        self.lw.setValue(1.5)
-        self.fs = SpinBox()
-        self.fs.setRange(6, 40)
-        self.fs.setValue(12)
-        self.add_row(scroll_layout, "全局线宽:", self.lw, "全局字号:", self.fs)
-
-        self.tk_len = SpinBox()
-        self.tk_len.setRange(1, 20)
-        self.tk_len.setValue(6)
-        self.tk_dir = ComboBox()
-        self.tk_dir.addItems(["in", "out"])
-        self.min_n = SpinBox()
-        self.min_n.setRange(0, 10)
-        self.min_n.setValue(2)
-        h_tk = QHBoxLayout()
-        h_tk.addWidget(BodyLabel("刻度长:"))
-        h_tk.addWidget(self.tk_len)
-        h_tk.addWidget(BodyLabel("朝向:"))
-        h_tk.addWidget(self.tk_dir)
-        h_tk.addWidget(BodyLabel("次分段:"))
-        h_tk.addWidget(self.min_n)
-        scroll_layout.addLayout(h_tk)
-
-        h_leg = QHBoxLayout()
-        self.grid = CheckBox("网格线")
-        h_leg.addWidget(self.grid)
-        self.leg_loc = ComboBox()
-        self.leg_loc.addItems(["best", "outside", "upper right", "upper left", "lower right", "lower left", "center right", "center left"])
-        h_leg.addWidget(BodyLabel("图例位置:"))
-        h_leg.addWidget(self.leg_loc, 1)
-        scroll_layout.addLayout(h_leg)
-
-        scroll_layout.addSpacing(5)
-
-        # ---- 智能分析 ----
-        scroll_layout.addWidget(StrongBodyLabel("智能分析"))
-        h_ana = QHBoxLayout()
-        self.peak = CheckBox("自动寻峰")
-        self.peak.setChecked(True)
-        self.auc = CheckBox("计算AUC比例")
-        self.auc.setChecked(True)
-        self.leg = CheckBox("显示图例")
-        self.leg.setChecked(True)
-        h_ana.addWidget(self.peak)
-        h_ana.addWidget(self.auc)
-        h_ana.addWidget(self.leg)
-        scroll_layout.addLayout(h_ana)
-
-        scroll_layout.addStretch()
-        scroll.setWidget(scroll_content)
-        layout_param.addWidget(scroll)
-
-        # 如果是设置模式，添加保存按钮并结束
-        if self.is_setting_mode:
-            self.btn_save_config = PrimaryPushButton("💾 确认并保存为全局默认参数", icon=FIF.SAVE)
-            self.btn_save_config.setFixedHeight(45)
-            self.btn_save_config.clicked.connect(self.save_settings_and_close)
-            self.param_layout.addWidget(self.btn_save_config)
-            # 设置模式不添加右侧画板
-            return
-
-        # 工作台模式：添加渲染按钮
-        self.btn_plot = PrimaryPushButton("⚡ 渲染层析图谱", icon=FIF.PLAY)
-        self.btn_plot.setFixedHeight(35)
-        self.btn_plot.clicked.connect(self.trigger_render)
-        self.param_layout.addWidget(self.btn_plot)
-
-        # ========== 右侧画板 (全新白色原生质感) ==========
-        self.fig = Figure(dpi=120)
-        self.ax = self.fig.add_subplot(111)
-        self.canvas = FigureCanvas(self.fig)
-        self.canvas.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Fixed)
-
-        self.canvas_container = QWidget()
-        # ✨ 赋予纯白圆角悬浮纸张质感
-        self.canvas_container.setStyleSheet("background-color: #FFFFFF; border: 1px solid #EAEAEA; border-radius: 8px;")
-        
-        # 🚨 局部变量，不覆盖基类布局
-        canvas_layout = QVBoxLayout(self.canvas_container) 
-        canvas_layout.setContentsMargins(10, 10, 10, 10)
-        canvas_layout.setAlignment(Qt.AlignCenter)
-        canvas_layout.addWidget(self.canvas)
-
-        self.scroll_canvas = QScrollArea()
-        self.scroll_canvas.setWidgetResizable(True)
-        self.scroll_canvas.setFrameShape(QScrollArea.NoFrame)
-        # ✨ 外层容器透明，完美融入系统背景
-        self.scroll_canvas.setStyleSheet("QScrollArea { background: transparent; border: none; }")
-        self.scroll_canvas.setWidget(self.canvas_container)
-
-        self.toolbar = NavigationToolbar(self.canvas, self)
-
-        # 导出控件 (✅ 修复变量名：恢复使用 self)
-        export_layout = QHBoxLayout()
-        export_layout.addStretch()
-        
-        self.chk_trans = CheckBox("透明背景")
-        export_layout.addWidget(self.chk_trans)
-        export_layout.addSpacing(15)
-        
-        self.combo_fmt = ComboBox()
-        self.combo_fmt.addItems(["pdf", "png", "svg"])
-        export_layout.addWidget(StrongBodyLabel("导出格式:"))
-        export_layout.addWidget(self.combo_fmt)
-        
-        btn_export = PushButton("保存图表", icon=FIF.SAVE)
-        btn_export.clicked.connect(self.export_plot)
-        export_layout.addWidget(btn_export)
-
-        # 将右侧内容放入基类真正安全的 canvas_panel 布局中
-        self.get_canvas_layout().addWidget(self.toolbar)
-        self.get_canvas_layout().addWidget(self.scroll_canvas)
-        self.get_canvas_layout().addLayout(export_layout)
-
-    # ------------------------------------
-    # 数据摄取与 UI 交互
-    # ------------------------------------
-    def dragEnterEvent(self, event):
-        if event.mimeData().hasUrls():
-            event.accept()
-        else:
-            event.ignore()
-
-    def dropEvent(self, event):
-        for url in event.mimeData().urls():
-            self.load_file(url.toLocalFile())
-
-    def load_file(self, filepath):
-        if not os.path.exists(filepath):
-            return
-        if filepath.lower().endswith(('.csv', '.xlsx', '.xls', '.txt')):
-            if filepath not in self.file_list:
-                self.file_list.append(filepath)
-                if not self.is_setting_mode:
-                    self.list_widget.addItem(os.path.basename(filepath))
-        if self.file_list and not self.is_setting_mode and not self.list_widget.currentItem():
-            self.list_widget.setCurrentRow(0)
-            self.trigger_render()
-
-    def open_files(self):
-        files, _ = QFileDialog.getOpenFileNames(self, "选择数据文件", "", "Data Files (*.csv *.xlsx *.xls *.txt);;All Files (*)")
-        for fp in files:
-            self.load_file(fp)
-
-    def clear_files(self):
-        self.file_list.clear()
-        if not self.is_setting_mode:
-            self.list_widget.clear()
-            self.fig.clear()
-            self.canvas.draw()
-
-    def get_float(self, line_edit, default=0.0):
-        try:
-            return float(line_edit.text())
-        except:
-            return default
-
-    # ------------------------------------
-    # 配置管理
-    # ------------------------------------
-    def _load_config(self):
-        """从 GlobalConfig 加载参数"""
-        config = GlobalConfig.get_all_plugin_settings(self.plugin_id)
-        if config:
-            self.apply_config_dict(config)
-
-    def _save_config(self):
-        """保存参数到 GlobalConfig"""
-        config = self.get_config_dict()
-        GlobalConfig.set_all_plugin_settings(self.plugin_id, config)
-
-    def get_config_dict(self):
-        """收集当前 UI 控件的值，返回字典"""
-        return {
-            "c1x": self.c1x.value(),
-            "c1y": self.c1y.value(),
-            "l1": self.l1.text(),
-            "ls1": self.ls1.currentText(),
-            "c2x": self.c2x.value(),
-            "c2y": self.c2y.value(),
-            "l2": self.l2.text(),
-            "ls2": self.ls2.currentText(),
-            "title": self.title.text(),
-            "xl": self.xl.text(),
-            "yl": self.yl.text(),
-            "x1": self.x1.text(),
-            "x2": self.x2.text(),
-            "xt_step": self.xt_step.text(),
-            "xt_n": self.xt_n.text(),
-            "y1": self.y1.text(),
-            "y2": self.y2.text(),
-            "yt_step": self.yt_step.text(),
-            "yt_n": self.yt_n.text(),
-            "spin_w": self.spin_w.value(),
-            "spin_h": self.spin_h.value(),
-            "b_title": self.b_title.isChecked(),
-            "b_label": self.b_label.isChecked(),
-            "b_tick": self.b_tick.isChecked(),
-            "b_leg": self.b_leg.isChecked(),
-            "lw": self.lw.value(),
-            "fs": self.fs.value(),
-            "tk_len": self.tk_len.value(),
-            "tk_dir": self.tk_dir.currentText(),
-            "min_n": self.min_n.value(),
-            "grid": self.grid.isChecked(),
-            "leg_loc": self.leg_loc.currentText(),
-            "peak": self.peak.isChecked(),
-            "auc": self.auc.isChecked(),
-            "leg": self.leg.isChecked()
-        }
-
-    def apply_config_dict(self, data):
-        """将字典值应用到 UI 控件"""
-        self.c1x.setValue(data.get("c1x", 0))
-        self.c1y.setValue(data.get("c1y", 1))
-        self.l1.setText(data.get("l1", "UV_280"))
-        self.ls1.setCurrentText(data.get("ls1", "-"))
-        self.c2x.setValue(data.get("c2x", 2))
-        self.c2y.setValue(data.get("c2y", 3))
-        self.l2.setText(data.get("l2", "UV_260"))
-        self.ls2.setCurrentText(data.get("ls2", "-"))
-        self.title.setText(data.get("title", "AKTA Plot"))
-        self.xl.setText(data.get("xl", "Elution volume (mL)"))
-        self.yl.setText(data.get("yl", "Absorbance (mAU)"))
-        self.x1.setText(data.get("x1", ""))
-        self.x2.setText(data.get("x2", ""))
-        self.xt_step.setText(data.get("xt_step", ""))
-        self.xt_n.setText(data.get("xt_n", ""))
-        self.y1.setText(data.get("y1", ""))
-        self.y2.setText(data.get("y2", ""))
-        self.yt_step.setText(data.get("yt_step", ""))
-        self.yt_n.setText(data.get("yt_n", ""))
-        self.spin_w.setValue(data.get("spin_w", 7.0))
-        self.spin_h.setValue(data.get("spin_h", 5.0))
-        self.b_title.setChecked(data.get("b_title", True))
-        self.b_label.setChecked(data.get("b_label", True))
-        self.b_tick.setChecked(data.get("b_tick", False))
-        self.b_leg.setChecked(data.get("b_leg", False))
-        self.lw.setValue(data.get("lw", 1.5))
-        self.fs.setValue(data.get("fs", 12))
-        self.tk_len.setValue(data.get("tk_len", 6))
-        self.tk_dir.setCurrentText(data.get("tk_dir", "in"))
-        self.min_n.setValue(data.get("min_n", 2))
-        self.grid.setChecked(data.get("grid", False))
-        self.leg_loc.setCurrentText(data.get("leg_loc", "best"))
-        self.peak.setChecked(data.get("peak", True))
-        self.auc.setChecked(data.get("auc", True))
-        self.leg.setChecked(data.get("leg", True))
-
-    def export_config(self):
-        """导出参数模板到文件"""
-        path, _ = QFileDialog.getSaveFileName(self, "保存 AKTA 参数模板", "akta_template.json", "JSON Files (*.json)")
-        if path:
-            with open(path, 'w', encoding='utf-8') as f:
-                json.dump(self.get_config_dict(), f, indent=4)
-            QMessageBox.information(self, "成功", "模板保存成功！")
-
-    def import_config(self):
-        """从文件导入参数模板"""
-        path, _ = QFileDialog.getOpenFileName(self, "载入 AKTA 参数模板", "", "JSON Files (*.json)")
-        if path:
-            with open(path, 'r', encoding='utf-8') as f:
-                self.apply_config_dict(json.load(f))
-            if not self.is_setting_mode:
-                self.trigger_render()
-
-    def save_settings_and_close(self):
-        """保存设置并关闭对话框（设置模式专用）"""
-        self._save_config()
-        parent_dlg = self.window()
-        if isinstance(parent_dlg, QDialog):
-            parent_dlg.accept()
-
-    # ------------------------------------
-    # 绘图核心
-    # ------------------------------------
-    def trigger_render(self, *args):
-        if self.is_setting_mode:
-            return
-        self._save_config()
-        self.render_plot()
-        dpi = self.fig.dpi
-        w_px = int(self.spin_w.value() * dpi)
-        h_px = int(self.spin_h.value() * dpi)
-        self.canvas.setFixedSize(w_px, h_px)
-        self.canvas_container.updateGeometry()
-
-    def export_plot(self):
-        if self.is_setting_mode:
-            return
-        fmt = self.combo_fmt.currentText()
-        is_transparent = self.chk_trans.isChecked()
-        row = self.list_widget.currentRow()
-        default_name = os.path.splitext(self.list_widget.item(max(0, row)).text())[0] + f"_AKTA.{fmt}" if self.list_widget.count() > 0 else f"AKTA_Plot.{fmt}"
-        file_path, _ = QFileDialog.getSaveFileName(self, "导出图表", default_name, f"Images (*.{fmt})")
-        if file_path:
-            try:
-                self.fig.savefig(file_path, dpi=600, bbox_inches="tight", transparent=is_transparent)
-                QMessageBox.information(self, "成功", f"图表已导出:\n{file_path}")
-            except Exception as e:
-                QMessageBox.critical(self, "导出失败", str(e))
-
-    def render_plot(self):
-        if self.is_setting_mode:
-            return
-        row = self.list_widget.currentRow()
-        if row < 0 or row >= len(self.file_list):
-            return
-
-        fp = self.file_list[row]
-        title_text = os.path.splitext(os.path.basename(fp))[0]
-
-        self.fig.clear()
-        self.fig.set_size_inches(self.spin_w.value(), self.spin_h.value())
-        self.ax = self.fig.add_subplot(111)
-
-        data = safe_load_array(fp)
-        if data.size == 0:
-            return
-
-        c1x, c1y = self.c1x.value(), self.c1y.value()
-        c2x, c2y = self.c2x.value(), self.c2y.value()
-        if data.shape[1] <= max(c1x, c1y, c2x, c2y):
-            return
-
-        x1, y1 = data[:, c1x], data[:, c1y]
-        x2, y2 = data[:, c2x], data[:, c2y]
-        m1 = ~np.isnan(x1) & ~np.isnan(y1)
-        m2 = ~np.isnan(x2) & ~np.isnan(y2)
-        x1, y1 = x1[m1], y1[m1]
-        x2, y2 = x2[m2], y2[m2]
-
-        lw = self.lw.value()
-        fs = self.fs.value()
-
-        fw_title = 'bold' if self.b_title.isChecked() else 'normal'
-        fw_label = 'bold' if self.b_label.isChecked() else 'normal'
-        fw_tick = 'bold' if self.b_tick.isChecked() else 'normal'
-        fw_leg = 'bold' if self.b_leg.isChecked() else 'normal'
-
-        name1 = self.l1.text() or "UV_280"
-        name2 = self.l2.text() or "UV_260"
-
-        self.ax.plot(x1, y1, color="royalblue", lw=lw, ls=self.ls1.currentText(), label=name1, zorder=2)
-        self.ax.plot(x2, y2, color="firebrick", lw=lw, ls=self.ls2.currentText(), label=name2, zorder=2)
-
-        self.ax.set_title(self.title.text() if self.title.text() else title_text,
-                          fontsize=fs + 2, fontweight=fw_title, pad=10)
-        self.ax.set_xlabel(self.xl.text(), fontsize=fs, fontweight=fw_label)
-        self.ax.set_ylabel(self.yl.text(), fontsize=fs, fontweight=fw_label)
-
-        if self.x1.text():
-            self.ax.set_xlim(left=self.get_float(self.x1))
-        if self.x2.text():
-            self.ax.set_xlim(right=self.get_float(self.x2))
-        if self.y1.text():
-            self.ax.set_ylim(bottom=self.get_float(self.y1))
-        if self.y2.text():
-            self.ax.set_ylim(top=self.get_float(self.y2))
-
-        try:
-            xt_step, xt_n = self.get_float(self.xt_step), self.get_float(self.xt_n)
-            if xt_step > 0:
-                self.ax.xaxis.set_major_locator(MultipleLocator(xt_step))
-            elif xt_n > 0:
-                self.ax.xaxis.set_major_locator(MaxNLocator(int(xt_n)))
-
-            yt_step, yt_n = self.get_float(self.yt_step), self.get_float(self.yt_n)
-            if yt_step > 0:
-                self.ax.yaxis.set_major_locator(MultipleLocator(yt_step))
-            elif yt_n > 0:
-                self.ax.yaxis.set_major_locator(MaxNLocator(int(yt_n)))
-        except:
-            pass
-
-        tk_len = self.tk_len.value()
-        tk_dir = self.tk_dir.currentText()
-        min_n = self.min_n.value()
-
-        self.ax.tick_params(which='major', width=lw, length=tk_len, labelsize=fs - 1, direction=tk_dir)
-        self.ax.tick_params(which='minor', width=lw * 0.7, length=tk_len * 0.6, direction=tk_dir)
-
-        if min_n > 0:
-            self.ax.xaxis.set_minor_locator(AutoMinorLocator(min_n))
-            self.ax.yaxis.set_minor_locator(AutoMinorLocator(min_n))
-        else:
-            self.ax.xaxis.set_minor_locator(NullLocator())
-            self.ax.yaxis.set_minor_locator(NullLocator())
-
-        for label in self.ax.get_xticklabels() + self.ax.get_yticklabels():
-            label.set_fontweight(fw_tick)
-
-        for sp in self.ax.spines.values():
-            sp.set_linewidth(lw)
-        self.ax.spines['top'].set_visible(False)
-        self.ax.spines['right'].set_visible(False)
-
-        if self.grid.isChecked():
-            self.ax.grid(True, which='major', ls='--', alpha=0.5)
-            self.ax.grid(True, which='minor', ls=':', alpha=0.2)
-
-        if self.leg.isChecked():
-            loc = self.leg_loc.currentText()
-            if loc == 'outside':
-                leg = self.ax.legend(frameon=False, fontsize=fs - 1, bbox_to_anchor=(1.02, 1), loc='upper left')
-            else:
-                leg = self.ax.legend(frameon=False, fontsize=fs - 1, loc=loc)
-            for text in leg.get_texts():
-                text.set_fontweight(fw_leg)
-
-        txts = []
-        if self.peak.isChecked() and len(y1) > 5:
-            cx1, cx2 = self.ax.get_xlim()
-            mask = (x1 >= cx1) & (x1 <= cx2)
-            if np.any(mask):
-                y_sm = np.convolve(y1, np.ones(5) / 5, mode='same')
-                sub_idx = np.where(mask)[0]
-                idx = sub_idx[np.argmax(y_sm[mask])]
-                px, py = x1[idx], y1[idx]
-                self.ax.axvline(px, color='gray', ls='--', alpha=0.5, zorder=1)
-                self.ax.text(px, py, f"{px:.2f}", fontsize=fs - 2, fontweight='bold', va='bottom')
+    max_cols = max(len(r) for r in raw_rows)
+    headers = [f"Col_{i}" for i in range(max_cols)]
+    if data_start_idx > 0:
+        header_rows = raw_rows[:data_start_idx]
+        main_names = []
+        curr = ""
+        if len(header_rows) >= 2:
+            for i in range(max_cols):
+                v = header_rows[-2][i] if i < len(header_rows[-2]) else ""
+                if v: curr = v
+                main_names.append(curr)
+        unit_row = header_rows[-1] if len(header_rows) >= 1 else []
+        for i in range(max_cols):
+            m = main_names[i] if main_names else f"Col_{i}"
+            u = unit_row[i] if i < len(unit_row) else ""
+            headers[i] = f"{m}_{u}" if u else m
+
+    data_body = []
+    for row in raw_rows[data_start_idx:]:
+        r = row + [""] * (max_cols - len(row))
+        data_body.append(r[:max_cols])
+
+    return pd.DataFrame(data_body, columns=headers)
+
+def expand_targets(target_str):
+    targets = set()
+    target_str = target_str.replace('"', '').replace("'", "")
+    parts = [p.strip() for p in target_str.split(',')]
+    for p in parts:
+        if not p: continue
+        if '-' in p and p.count('-') == 1:
+            s, e = p.split('-')
+            s, e = s.strip(), e.strip()
+            if s.isdigit() and e.isdigit():
+                targets.update([str(i) for i in range(int(s), int(e)+1)])
+            elif len(s)>0 and len(e)>0 and s[0].isalpha() and e[0].isalpha() and s[0].upper() == e[0].upper():
                 try:
-                    txts.append(f"Ratio(Peak): {np.interp(px, x2, y2) / py:.2f}")
-                except:
-                    pass
+                    n_s, n_e = int(s[1:]), int(e[1:])
+                    targets.update([f"{s[0].upper()}{i}" for i in range(min(n_s, n_e), max(n_s, n_e)+1)])
+                except: targets.add(p)
+            else: targets.add(p)
+        else: targets.add(p)
+    return [t.upper() for t in targets]
 
-        if self.auc.isChecked() and len(y1) > 2:
-            a1 = np.trapz(np.maximum(y1, 0), x1)
-            a2 = np.trapz(np.maximum(y2, 0), x2)
-            txts.append(f"Ratio(AUC): {a2 / a1 if a1 != 0 else 0:.2f}")
-
-        if txts:
-            self.ax.text(0.02, 0.95, "\n".join(txts), transform=self.ax.transAxes,
-                         fontsize=fs - 2, fontweight='bold', va='top',
-                         bbox=dict(boxstyle="round", fc="white", alpha=0.8))
-
-        self.fig.tight_layout()
-        self.canvas.draw()
-
-
-# ==========================================
-# 插件描述器
-# ==========================================
-class AKTAPlugin(BasePlugin):
-    plugin_id = "akta_analyzer"
-    plugin_name = "AKTA 层析分析"
-    icon = "📉"
-    trigger_tag = "AKTA"
-
-    def get_ui(self, parent=None):
-        return AktaUI(parent, is_setting_mode=False)
-
-    def get_setting_card(self, parent=None):
-        from qfluentwidgets import PrimaryPushSettingCard, FluentIcon as FIF
-        from PyQt5.QtWidgets import QDialog, QVBoxLayout
-
-        card = PrimaryPushSettingCard(
-            "配置全局默认参数",
-            FIF.EDIT,
-            "📉 AKTA 层析分析",
-            "修改工作站中 AKTA 图谱的全局默认线型、坐标轴与寻峰偏好",
-            parent
-        )
-
-        def show_global_settings_dialog():
-            dlg = QDialog(card)
-            dlg.setWindowTitle("AKTA 全局默认参数预设中心")
-            dlg.resize(460, 750)
-            layout = QVBoxLayout(dlg)
-            settings_ui = AktaUI(dlg, is_setting_mode=True)
-            layout.addWidget(settings_ui)
-            dlg.exec_()
-
-        card.clicked.connect(show_global_settings_dialog)
-        return card
-
-    @staticmethod
-    def run(file_path, archive_dir):
-        """后台自动处理"""
+def get_sync_workspace():
+    config_file = os.path.abspath(os.path.join(os.path.dirname(__file__), "../sciforge_config.json"))
+    if os.path.exists(config_file):
         try:
-            # 从 GlobalConfig 读取配置
-            config = GlobalConfig.get_all_plugin_settings("akta_analyzer")
-            u = config if config else {}
+            with open(config_file, "r", encoding="utf-8") as f:
+                cfg = json.load(f)
+                if cfg.get("data_hub_path"): return cfg.get("data_hub_path")
+        except: pass
+    return os.path.abspath(os.path.join(os.path.dirname(__file__), "../SciForge_Workspace/SciForge_Data"))
 
-            data = safe_load_array(file_path)
-            c1x, c1y = u.get('c1x', 0), u.get('c1y', 1)
-            c2x, c2y = u.get('c2x', 2), u.get('c2y', 3)
+def get_akta_df(args, workspace):
+    f_path = str(getattr(args, 'file_path', '')).strip()
+    if not f_path: raise Exception("未选择任何文件！请先在上方选中包含层析数据的源文件。")
 
-            if data.size == 0 or data.shape[1] <= max(c1x, c1y, c2x, c2y):
-                return "", "【AKTA分析跳过】数据为空或列数不足（请检查全局默认参数中的 Index 映射）。"
+    in_file = os.path.join(workspace, f_path)
+    if not os.path.exists(in_file): raise Exception(f"找不到文件: {in_file}")
+    
+    if in_file.lower().endswith(('.xlsx', '.xls')):
+        return pd.read_excel(in_file, header=None).apply(pd.to_numeric, errors='coerce').dropna(axis=0, how='all')
+        
+    for enc in ["utf-16", "utf-8-sig", "utf-8", "gbk", "latin1"]:
+        try:
+            with open(in_file, 'r', encoding=enc) as f:
+                content = f.read()
+            df = parse_unicorn_text(content)
+            if not df.empty: return df
+        except: continue
+    raise Exception("数据清洗后未发现任何有效数字矩阵！请检查输入的层析文件。")
 
-            x1, y1 = data[:, c1x], data[:, c1y]
-            x2, y2 = data[:, c2x], data[:, c2y]
-            m1 = ~np.isnan(x1) & ~np.isnan(y1)
-            m2 = ~np.isnan(x2) & ~np.isnan(y2)
-            x1, y1 = x1[m1], y1[m1]
-            x2, y2 = x2[m2], y2[m2]
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser()
+    for item in UI_SCHEMA:
+        if item["type"] == "boolean": 
+            parser.add_argument(f"--{item['key']}", action="store_true")
+        elif item["type"] == "number": 
+            parser.add_argument(f"--{item['key']}", type=float, default=item.get("default", 0.0))
+        else: 
+            parser.add_argument(f"--{item['key']}", type=str, default=str(item.get("default", "")))
+            
+    args = parser.parse_args()
 
-            from matplotlib.figure import Figure
-            from matplotlib.backends.backend_agg import FigureCanvasAgg
-            import matplotlib.pyplot as plt
+    print(">>> 启动 AKTA 层析极速分析引擎...")
+    workspace = get_sync_workspace()
+    temp_dir = os.path.join(workspace, ".cache")
+    os.makedirs(temp_dir, exist_ok=True)
 
-            plt.rcParams['font.sans-serif'] = ['SimHei', 'Microsoft YaHei']
-            plt.rcParams['axes.unicode_minus'] = False
+    try: 
+        df = get_akta_df(args, workspace)
+    except Exception as e: 
+        print(f"❌ [Fatal] 数据摄取失败: {e}"); sys.exit(1)
 
-            fig = Figure(figsize=(u.get("spin_w", 7.0), u.get("spin_h", 5.0)), dpi=150)
-            canvas = FigureCanvasAgg(fig)
-            ax = fig.add_subplot(111)
+    if df.empty:
+        print("❌ [Fatal] 数据清洗后为空！"); sys.exit(1)
 
-            lw = u.get('lw', 1.5)
-            fs = u.get('fs', 12)
-            fw_title = 'bold' if u.get('b_title', True) else 'normal'
-            fw_label = 'bold' if u.get('b_label', True) else 'normal'
-            fw_tick = 'bold' if u.get('b_tick', False) else 'normal'
-            fw_leg = 'bold' if u.get('b_leg', False) else 'normal'
+    c1x_idx, c1y_idx = int(args.c1x), int(args.c1y)
+    c2x_idx, c2y_idx = int(args.c2x), int(args.c2y)
+    fx_idx, fy_idx = -1, -1
 
-            name1 = u.get('l1', "UV_280")
-            name2 = u.get('l2', "UV_260")
+    if args.auto_col:
+        c1x_name, c1y_name, c2x_name, c2y_name, fx_name, fy_name = None, None, None, None, None, None
+        for col in df.columns:
+            cl = str(col).lower()
+            if args.c1_name.lower() in cl:
+                if 'ml' in cl or 'vol' in cl: c1x_name = col
+                elif 'mau' in cl or 'abs' in cl or 'uv' in cl: c1y_name = col
+            if args.c2_name.lower() in cl:
+                if 'ml' in cl or 'vol' in cl: c2x_name = col
+                elif 'mau' in cl or 'abs' in cl or 'uv' in cl: c2y_name = col
+            if args.frac_name.lower() in cl:
+                if 'ml' in cl or 'vol' in cl: fx_name = col
+                else: fy_name = col
 
-            ax.plot(x1, y1, color="royalblue", lw=lw, ls=u.get('ls1', '-'), label=name1, zorder=2)
-            ax.plot(x2, y2, color="firebrick", lw=lw, ls=u.get('ls2', '-'), label=name2, zorder=2)
+        if c1x_name and c1y_name: c1x_idx, c1y_idx = df.columns.get_loc(c1x_name), df.columns.get_loc(c1y_name)
+        if c2x_name and c2y_name: c2x_idx, c2y_idx = df.columns.get_loc(c2x_name), df.columns.get_loc(c2y_name)
+        if fx_name and fy_name: fx_idx, fy_idx = df.columns.get_loc(fx_name), df.columns.get_loc(fy_name)
 
-            title_text = os.path.splitext(os.path.basename(file_path))[0]
-            ax.set_title(u.get('title', "AKTA Plot") if u.get('title', "") else title_text,
-                         fontsize=fs + 2, fontweight=fw_title, pad=10)
-            ax.set_xlabel(u.get('xl', "Elution volume (mL)"), fontsize=fs, fontweight=fw_label)
-            ax.set_ylabel(u.get('yl', "Absorbance (mAU)"), fontsize=fs, fontweight=fw_label)
+    def extract_float_pair(df, idx_x, idx_y):
+        if idx_x >= len(df.columns) or idx_y >= len(df.columns) or idx_x < 0 or idx_y < 0:
+            return np.array([]), np.array([])
+        vx = pd.to_numeric(df.iloc[:, idx_x], errors='coerce').values
+        vy = pd.to_numeric(df.iloc[:, idx_y], errors='coerce').values
+        valid = ~np.isnan(vx) & ~np.isnan(vy)
+        return vx[valid], vy[valid]
 
-            if u.get('x1', ""):
-                ax.set_xlim(left=float(u['x1']))
-            if u.get('x2', ""):
-                ax.set_xlim(right=float(u['x2']))
-            if u.get('y1', ""):
-                ax.set_ylim(bottom=float(u['y1']))
-            if u.get('y2', ""):
-                ax.set_ylim(top=float(u['y2']))
+    x1, y1 = extract_float_pair(df, c1x_idx, c1y_idx)
+    x2, y2 = extract_float_pair(df, c2x_idx, c2y_idx)
 
-            try:
-                xt_step, xt_n = float(u.get('xt_step', 0)), float(u.get('xt_n', 0))
-                if xt_step > 0:
-                    ax.xaxis.set_major_locator(MultipleLocator(xt_step))
-                elif xt_n > 0:
-                    ax.xaxis.set_major_locator(MaxNLocator(int(xt_n)))
+    plt.rcParams['font.sans-serif'] = ['Arial', 'SimHei', 'DejaVu Sans']
+    plt.rcParams['axes.unicode_minus'] = False
+    fs, lw = args.fs, args.lw
+    
+    fw_title = 'bold' if getattr(args, 'b_title', True) else 'normal'
+    fw_label = 'bold' if getattr(args, 'b_label', True) else 'normal'
+    fw_tick  = 'bold' if getattr(args, 'b_tick', False) else 'normal'
+    fw_leg   = 'bold' if getattr(args, 'b_leg', False) else 'normal'
 
-                yt_step, yt_n = float(u.get('yt_step', 0)), float(u.get('yt_n', 0))
-                if yt_step > 0:
-                    ax.yaxis.set_major_locator(MultipleLocator(yt_step))
-                elif yt_n > 0:
-                    ax.yaxis.set_major_locator(MaxNLocator(int(yt_n)))
-            except:
-                pass
+    fig = plt.figure(figsize=(args.spin_w, args.spin_h), dpi=150)
+    ax = fig.add_subplot(111)
 
-            tk_len = u.get('tk_len', 6)
-            tk_dir = u.get('tk_dir', "in")
-            min_n = u.get('min_n', 2)
+    if len(x1) > 0: ax.plot(x1, y1, color="royalblue", lw=lw, label=f"UV_{args.c1_name}", zorder=3)
+    if len(x2) > 0: ax.plot(x2, y2, color="firebrick", lw=lw, label=f"UV_{args.c2_name}", zorder=2)
 
-            ax.tick_params(which='major', width=lw, length=tk_len, labelsize=fs - 1, direction=tk_dir)
-            ax.tick_params(which='minor', width=lw * 0.7, length=tk_len * 0.6, direction=tk_dir)
+    f_path_str = str(getattr(args, 'file_path', '')).strip()
+    base_name = os.path.splitext(os.path.basename(f_path_str))[0] if f_path_str else "AKTA_Data"
+    plot_title = base_name if args.title == "AKTA Chromatography" else f"{base_name} - {args.title}"
 
-            if min_n > 0:
-                ax.xaxis.set_minor_locator(AutoMinorLocator(min_n))
-                ax.yaxis.set_minor_locator(AutoMinorLocator(min_n))
-            else:
-                ax.xaxis.set_minor_locator(NullLocator())
-                ax.yaxis.set_minor_locator(NullLocator())
+    ax.set_title(plot_title, fontsize=fs+2, fontweight=fw_title, pad=10)
+    ax.set_xlabel(args.xl, fontsize=fs, fontweight=fw_label)
+    ax.set_ylabel(args.yl, fontsize=fs, fontweight=fw_label)
 
-            for label in ax.get_xticklabels() + ax.get_yticklabels():
-                label.set_fontweight(fw_tick)
+    if args.x1 != "": ax.set_xlim(left=float(args.x1))
+    if args.x2 != "": ax.set_xlim(right=float(args.x2))
+    if args.y1 != "": ax.set_ylim(bottom=float(args.y1))
+    if args.y2 != "": ax.set_ylim(top=float(args.y2))
 
-            for sp in ax.spines.values():
-                sp.set_linewidth(lw)
-            ax.spines['top'].set_visible(False)
-            ax.spines['right'].set_visible(False)
+    try:
+        xt_step, xt_n = float(getattr(args, 'xt_step', 0)), float(getattr(args, 'xt_n', 0))
+        if xt_step > 0: ax.xaxis.set_major_locator(MultipleLocator(xt_step))
+        elif xt_n > 0: ax.xaxis.set_major_locator(MaxNLocator(int(xt_n)))
 
-            if u.get('grid', False):
-                ax.grid(True, which='major', ls='--', alpha=0.5)
-                ax.grid(True, which='minor', ls=':', alpha=0.2)
+        yt_step, yt_n = float(getattr(args, 'yt_step', 0)), float(getattr(args, 'yt_n', 0))
+        if yt_step > 0: ax.yaxis.set_major_locator(MultipleLocator(yt_step))
+        elif yt_n > 0: ax.yaxis.set_major_locator(MaxNLocator(int(yt_n)))
+    except: pass
 
-            if u.get('leg', True):
-                loc = u.get('leg_loc', "best")
-                if loc == 'outside':
-                    leg = ax.legend(frameon=False, fontsize=fs - 1, bbox_to_anchor=(1.02, 1), loc='upper left')
-                else:
-                    leg = ax.legend(frameon=False, fontsize=fs - 1, loc=loc)
-                for text in leg.get_texts():
-                    text.set_fontweight(fw_leg)
+    tk_len = int(getattr(args, 'tk_len', 6))
+    tk_dir = getattr(args, 'tk_dir', "in")
+    min_n = int(getattr(args, 'min_n', 2))
 
-            txts = []
-            peak_x, peak_y, auc_ratio = None, None, None
+    ax.tick_params(which='major', width=lw, length=tk_len, labelsize=fs-1, direction=tk_dir)
+    ax.tick_params(which='minor', width=lw*0.7, length=tk_len*0.6, direction=tk_dir)
 
-            if u.get('peak', True) and len(y1) > 5:
-                cx1, cx2 = ax.get_xlim()
-                mask = (x1 >= cx1) & (x1 <= cx2)
+    if min_n > 0:
+        ax.xaxis.set_minor_locator(AutoMinorLocator(min_n))
+        ax.yaxis.set_minor_locator(AutoMinorLocator(min_n))
+    else:
+        ax.xaxis.set_minor_locator(NullLocator())
+        ax.yaxis.set_minor_locator(NullLocator())
+
+    for label in ax.get_xticklabels() + ax.get_yticklabels(): label.set_fontweight(fw_tick)
+    for sp in ax.spines.values(): sp.set_linewidth(lw)
+    ax.spines['top'].set_visible(False); ax.spines['right'].set_visible(False)
+
+    if getattr(args, 'grid', False):
+        ax.grid(True, which='major', ls='--', alpha=0.5)
+        ax.grid(True, which='minor', ls=':', alpha=0.2)
+
+    ymin, ymax = ax.get_ylim()
+    ax.set_ylim(ymin, ymax)
+
+    metrics_data = {}
+    frac_intervals = []
+
+    if fx_idx != -1 and fy_idx != -1:
+        f_vols = pd.to_numeric(df.iloc[:, fx_idx], errors='coerce').values
+        f_names_raw = df.iloc[:, fy_idx].fillna("").astype(str).values
+        
+        clean_names = []
+        for n in f_names_raw:
+            n_str = str(n).strip(' \'"').upper()
+            if n_str.endswith('.0'): n_str = n_str[:-2]
+            clean_names.append(n_str)
+        clean_names = np.array(clean_names)
+
+        valid_f = ~np.isnan(f_vols) & (clean_names != "")
+        vols, names = f_vols[valid_f], clean_names[valid_f]
+
+        for i in range(len(names)):
+            start = vols[i]
+            end = vols[i+1] if i+1 < len(vols) else vols[i] + (vols[i] - vols[i-1] if i>0 else 1.0)
+            frac_intervals.append((names[i], start, end))
+
+    if getattr(args, 'show_frac', True) and frac_intervals:
+        trans = ax.get_xaxis_transform()
+        for fname, start, end in frac_intervals:
+            ax.plot([start, start], [0, 0.03], transform=trans, color='gray', lw=1.2, zorder=4, clip_on=False)
+            ax.text(start + (end-start)/2, 0.035, fname, transform=trans, rotation=90, va='bottom', ha='center', fontsize=fs-4, color='#333333', zorder=5, clip_on=False)
+
+    target_list = expand_targets(getattr(args, 'target_fracs', ''))
+    if target_list and frac_intervals and len(x1) > 0:
+        total_auc = trapz_func(np.maximum(y1, 0), x1)
+        target_auc = 0.0
+        highlighted_tubes = []
+        
+        global_mask = np.zeros_like(x1, dtype=bool)
+
+        for fname, start, end in frac_intervals:
+            if fname in target_list:
+                mask = (x1 >= start) & (x1 <= end)
                 if np.any(mask):
-                    y_sm = np.convolve(y1, np.ones(5) / 5, mode='same')
-                    sub_idx = np.where(mask)[0]
-                    idx = sub_idx[np.argmax(y_sm[mask])]
-                    px, py = x1[idx], y1[idx]
-                    ax.axvline(px, color='gray', ls='--', alpha=0.5, zorder=1)
-                    ax.text(px, py, f"{px:.2f}", fontsize=fs - 2, fontweight='bold', va='bottom')
-                    peak_x, peak_y = px, py
-                    try:
-                        ratio_peak = np.interp(px, x2, y2) / py
-                        txts.append(f"Ratio(Peak): {ratio_peak:.2f}")
-                    except:
-                        pass
+                    global_mask |= mask
+                    target_auc += trapz_func(np.maximum(y1[mask], 0), x1[mask])
+                    highlighted_tubes.append(fname)
+        
+        if highlighted_tubes:
+            ax.fill_between(x1, ymin, y1, where=global_mask, color='royalblue', alpha=0.4, zorder=1, linewidth=0)
+            
+            if total_auc > 0:
+                ratio = (target_auc / total_auc) * 100
+                metrics_data["目标收集管"] = f"{len(highlighted_tubes)} 管"
+                metrics_data["靶向回收积分量 (AUC)"] = f"{target_auc:.2f}"
+                metrics_data["占总图谱面积比率"] = f"{ratio:.2f} %"
 
-            if u.get('auc', True) and len(y1) > 2:
-                a1 = np.trapz(np.maximum(y1, 0), x1)
-                a2 = np.trapz(np.maximum(y2, 0), x2)
-                if a1 != 0:
-                    auc_ratio = a2 / a1
-                    txts.append(f"Ratio(AUC): {auc_ratio:.2f}")
+    if getattr(args, 'leg', True) and (len(x1)>0 or len(x2)>0):
+        loc = getattr(args, 'leg_loc', 'best') 
+        leg = ax.legend(frameon=False, fontsize=fs-1, bbox_to_anchor=(1.02, 1) if loc=='outside' else None, loc='upper left' if loc=='outside' else loc)
+        for text in leg.get_texts(): text.set_fontweight(fw_leg)
 
-            if txts:
-                ax.text(0.02, 0.95, "\n".join(txts), transform=ax.transAxes,
-                        fontsize=fs - 2, fontweight='bold', va='top',
-                        bbox=dict(boxstyle="round", fc="white", alpha=0.8))
+    if getattr(args, 'peak', True) and len(y1) > 5:
+        cx1, cx2 = ax.get_xlim()
+        mask = (x1 >= cx1) & (x1 <= cx2)
+        if np.any(mask):
+            y_sm = np.convolve(y1, np.ones(5)/5, mode='same')
+            sub_idx = np.where(mask)[0]
+            idx = sub_idx[np.argmax(y_sm[mask])]
+            px, py = x1[idx], y1[idx]
+            ax.plot([px, px], [ymin, py], color='gray', ls='--', alpha=0.6, zorder=1)
+            ax.text(px, py, f"{px:.2f}", fontsize=fs-2, fontweight='bold', va='bottom', ha='center')
+            metrics_data["全图主峰洗脱位置 (mL)"] = f"{px:.2f}"
+            if len(x2) > 0:
+                try:
+                    ratio_peak = np.interp(px, x2, y2) / py
+                    metrics_data[f"主峰波长纯度比 ({args.c2_name}/{args.c1_name})"] = f"{ratio_peak:.3f}"
+                except: pass
 
-            fig.tight_layout()
+    fig.tight_layout()
 
-            out_name = f"plot_AKTA_{os.path.basename(file_path)}.png"
-            out_path = os.path.join(archive_dir, out_name)
-            fig.savefig(out_path, dpi=150)
-            fig.clf()
+    import uuid
+    uid = uuid.uuid4().hex[:6]
+    ext = getattr(args, 'fmt', 'png')
+    img_path = os.path.join(temp_dir, f"Temp_AKTA_{uid}.{ext}")
+    
+    # --- 保存时带上透明选项 ---
+    is_transparent = getattr(args, 'transparent', False)
+    fig.savefig(img_path, dpi=300, bbox_inches='tight', transparent=is_transparent)
 
-            res_text = "📉 【AKTA 层析分析完毕】<br>"
-            if peak_x is not None:
-                res_text += f"主峰洗脱位置: {peak_x:.2f} mL (吸光度: {peak_y:.2f})<br>"
-            if auc_ratio is not None:
-                res_text += f"积分面积纯度比 (UV260/280): {auc_ratio:.2f}"
-
-            return out_path, res_text
-
-        except Exception as e:
-            return "", f"AKTA 自动作图引擎执行失败: {str(e)}"
+    print("\n✅ [Success] 核心推演完成，图谱与仪表盘指标已就绪！")
+    print(f"[OutputFile] .cache/Temp_AKTA_{uid}.{ext}")
+    if metrics_data:
+        print(f"[OutputMetrics] {json.dumps(metrics_data, ensure_ascii=False)}")
+        
+    sys.exit(0)

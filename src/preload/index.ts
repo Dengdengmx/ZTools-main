@@ -235,6 +235,7 @@ const api = {
   },
   openPluginDevTools: () => ipcRenderer.invoke('open-plugin-devtools'),
   detachPlugin: () => ipcRenderer.invoke('detach-plugin'),
+  openDashboardWindow: () => ipcRenderer.invoke('open-dashboard-window'), // 🌟 新增：独立呼出仪表盘接口
   // 快捷键相关
   updateShortcut: (shortcut: string) => ipcRenderer.invoke('update-shortcut', shortcut),
   getCurrentShortcut: () => ipcRenderer.invoke('get-current-shortcut'),
@@ -557,6 +558,7 @@ declare global {
       onFocusSubInput: (callback: () => void) => void
       openPluginDevTools: () => Promise<{ success: boolean; error?: string }>
       detachPlugin: () => Promise<{ success: boolean; error?: string }>
+      openDashboardWindow: () => Promise<void> // 🌟 新增：独立呼出仪表盘接口
       // 快捷键相关
       updateShortcut: (shortcut: string) => Promise<{ success: boolean; error?: string }>
       getCurrentShortcut: () => Promise<string>

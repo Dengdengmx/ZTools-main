@@ -7,26 +7,7 @@
             "cols": 6,
             "desc": "常温存放区。用于存放常规离心管、枪头、室温保存的试剂与常温样本盒等。",
             "icon": "folder",
-            "containers": {
-                "cont_301c1b": {
-                    "name": "新建容器 46",
-                    "type": "freeform",
-                    "r": 0,
-                    "c": 1,
-                    "rs": 1,
-                    "cs": 3,
-                    "id": "cont_301c1b"
-                },
-                "cont_8ebb66": {
-                    "name": "新容器",
-                    "type": "9x9",
-                    "r": 0,
-                    "c": 0,
-                    "rs": 1,
-                    "cs": 1,
-                    "id": "cont_8ebb66"
-                }
-            },
+            "containers": {},
             "inner_boxes": {}
         },
         "equip_chromatography": {

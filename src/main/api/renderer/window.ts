@@ -1,4 +1,6 @@
-import { ipcMain, screen } from 'electron'
+import { ipcMain, screen, BrowserWindow } from 'electron'
+import path from 'path'
+import fs from 'fs'
 import { WINDOW_INITIAL_HEIGHT, WINDOW_WIDTH } from '../../common/constants.js'
 import windowManager from '../../managers/windowManager.js'
 
@@ -63,6 +65,9 @@ export class WindowAPI {
       return this.currentAssemblyTarget
     })
     ipcMain.on('open-settings', () => this.openSettings())
+
+    // 🌟 挂载开启独立工作站窗口的路由
+    ipcMain.handle('open-dashboard-window', () => this.openDashboardWindow())
   }
 
   private setupWindowEvents(): void {
@@ -112,6 +117,7 @@ export class WindowAPI {
       }
     }
   }
+
   public getWindowPosition(): { x: number; y: number } {
     if (this.mainWindow) {
       const [x, y] = this.mainWindow.getPosition()
@@ -166,6 +172,53 @@ export class WindowAPI {
   public async updateAutoBackToSearch(autoBackToSearch: string): Promise<void> {
     await windowManager.updateAutoBackToSearch(autoBackToSearch)
     console.log('[WindowAPI] 更新自动返回搜索配置:', autoBackToSearch)
+  }
+
+  // 🌟 新增：独立孵化工作站窗口的方法 (修复白屏崩溃版本)
+  public openDashboardWindow(): void {
+    if (!this.mainWindow) return
+
+    // 🚨 核心修复 1: 动态多级探测 preload.js 路径，防止由于打包层级不同导致找不到 preload 从而白屏
+    let preloadPath = path.join(__dirname, '../../../preload/index.js')
+    if (!fs.existsSync(preloadPath)) {
+        preloadPath = path.join(__dirname, '../../preload/index.js')
+    }
+    if (!fs.existsSync(preloadPath)) {
+        preloadPath = path.join(__dirname, '../preload/index.js')
+    }
+
+    const isMac = process.platform === 'darwin'
+    const dashWin = new BrowserWindow({
+      width: 1200,
+      height: 800,
+      minWidth: 800,
+      minHeight: 600,
+      frame: isMac ? false : true,
+      titleBarStyle: isMac ? 'hiddenInset' : 'default',
+      autoHideMenuBar: true,
+      backgroundColor: '#11111b', // 强制黑底色，防止渲染前出现刺眼的白屏闪烁
+      title: "Mtools 实验室工作站",
+      ...(isMac && { trafficLightPosition: { x: 15, y: 18 } }),
+      webPreferences: {
+        preload: preloadPath,
+        contextIsolation: true,
+        nodeIntegration: false,
+        webSecurity: false,
+        backgroundThrottling: false
+      }
+    })
+
+    // 🚨 核心修复 2: 提取当前主窗口 URL，并完美保留 Vue 的 Hash 路由结构，防止路由丢失导致白纸
+    let currentUrl = this.mainWindow.webContents.getURL()
+    let hash = currentUrl.includes('#') ? '#' + currentUrl.split('#')[1] : ''
+    let baseUrl = currentUrl.split('#')[0].split('?')[0]
+
+    dashWin.loadURL(`${baseUrl}?mode=dashboard${hash}`)
+
+    dashWin.once('ready-to-show', () => {
+      dashWin.show()
+      this.hideWindow() // 隐藏主搜索框，等待热键再次唤醒
+    })
   }
 }
 

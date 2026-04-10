@@ -1,70 +1,137 @@
 # plugins/plugin_spr.py
-"""
-SPR 动力学拟合分析插件
-提供 SPR 数据的可视化与 SCK 动力学拟合功能。
-(极致紧凑亮色 UI 优化版，彻底修复无限嵌套卡死 Bug，核心算法保持纯净)
-"""
-
 import os
 import sys
+import argparse
 import json
 import pandas as pd
 import numpy as np
 from scipy.optimize import curve_fit
-from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg as FigureCanvas
-from matplotlib.backends.backend_qt5agg import NavigationToolbar2QT as NavigationToolbar
-from matplotlib.figure import Figure
+import matplotlib
+matplotlib.use('Agg') 
+import matplotlib.pyplot as plt
+from matplotlib.ticker import AutoMinorLocator, MultipleLocator, MaxNLocator, NullLocator
+import uuid
 
-from PyQt5.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QDialog, QScrollArea, 
-                             QMessageBox, QFileDialog, QSizePolicy)
-from PyQt5.QtCore import Qt
+PLUGIN_NAME = "SPR 动力学批量极速拟合"
+PLUGIN_ICON = "📈"
+PLUGIN_DESC = "自动识别 Biacore/Octet 表头，支持一键批量导入数十个文件，并自动生成多维图表画廊与全套指标。"
 
-from qfluentwidgets import (LineEdit, SpinBox, DoubleSpinBox, CheckBox, ComboBox, 
-                            BodyLabel, PushButton, PrimaryPushButton, 
-                            StrongBodyLabel, ListWidget, FluentIcon as FIF)
+UI_SCHEMA = [
+    {"key": "file_path", "label": "📁 框选本地 SPR 原始数据 (.csv/.txt/.xlsx)", "type": "file", "span": 12},
 
-from core.plugin_manager import BasePlugin
-from core.ui_base import BasePluginUI
-from core.config import GlobalConfig
+    {"key": "auto_col", "label": "🤖 开启智能表头嗅探 (勾选此项将无视下方【手动】列号)", "type": "boolean", "default": True, "span": 12},
+    {"key": "k_raw_x", "label": "[自动] Raw X", "type": "string", "default": "nM_X", "span": 3},
+    {"key": "k_raw_y", "label": "[自动] Raw Y", "type": "string", "default": "nM_Y", "span": 3},
+    {"key": "k_fit_x", "label": "[自动] Fit X", "type": "string", "default": "Fit_X", "span": 3},
+    {"key": "k_fit_y", "label": "[自动] Fit Y", "type": "string", "default": "Fit_Y", "span": 3},
 
-# ==========================================
-# 核心算法区 (原生算法，保持纯净，零修改)
-# ==========================================
-def safe_load_array(filepath, skiprows=0):
-    if filepath.lower().endswith(('.xlsx', '.xls')):
-        df = pd.read_excel(filepath, header=None, skiprows=skiprows, engine='openpyxl')
-        return df.apply(pd.to_numeric, errors='coerce').values
-        
-    for enc in ["utf-8-sig", "utf-8", "utf-16", "gbk", "latin1"]:
-        try:
-            with open(filepath, "r", encoding=enc) as f: content = f.readlines()
-            break
-        except: continue
-        
-    data_rows = []
-    max_cols = 0
-    for i, line in enumerate(content):
-        if i < skiprows: continue
-        line = line.strip()
-        if not line: continue
-        
-        if '\t' in line: parts = line.split('\t')
-        elif ',' in line: parts = line.split(',')
-        elif ';' in line: parts = line.split(';')
-        else: parts = line.split()
-        
-        row = []
-        for p in parts:
-            p = p.strip()
-            try: row.append(float(p))
-            except ValueError: row.append(np.nan)
-        
-        if row and not all(np.isnan(x) for x in row):
-            data_rows.append(row)
-            max_cols = max(max_cols, len(row))
+    {"key": "c_rx", "label": "[手动] Raw X列", "type": "number", "default": 0, "span": 3},
+    {"key": "c_ry", "label": "[手动] Raw Y列", "type": "number", "default": 1, "span": 3},
+    {"key": "c_fx", "label": "[手动] Fit X列", "type": "number", "default": 2, "span": 3},
+    {"key": "c_fy", "label": "[手动] Fit Y列", "type": "number", "default": 3, "span": 3},
+
+    {"key": "conc", "label": "最高浓度(M)", "type": "string", "default": "1e-7", "span": 3},
+    {"key": "ton", "label": "结合点(s) [-1自动]", "type": "number", "default": -1.0, "span": 3},
+    {"key": "toff", "label": "解离点(s) [-1自动]", "type": "number", "default": -1.0, "span": 3},
+    {"key": "skip", "label": "跳过波动(s)", "type": "number", "default": 1.5, "span": 3},
+
+    {"key": "title", "label": "图表主标题", "type": "string", "default": "SPR Kinetics", "span": 12},
+    {"key": "xl", "label": "X 轴标签", "type": "string", "default": "Time (s)", "span": 6},
+    {"key": "yl", "label": "Y 轴标签", "type": "string", "default": "Response (RU)", "span": 6},
+    
+    {"key": "x1", "label": "X起点(留空自动)", "type": "string", "default": "", "span": 3},
+    {"key": "x2", "label": "X终点(留空自动)", "type": "string", "default": "", "span": 3},
+    {"key": "y1", "label": "Y起点(留空自动)", "type": "string", "default": "", "span": 3},
+    {"key": "y2", "label": "Y终点(留空自动)", "type": "string", "default": "", "span": 3},
+
+    {"key": "xt_step", "label": "X主间隔", "type": "number", "default": 0, "span": 3},
+    {"key": "xt_n", "label": "X主刻度数", "type": "number", "default": 0, "span": 3},
+    {"key": "yt_step", "label": "Y主间隔", "type": "number", "default": 0, "span": 3},
+    {"key": "yt_n", "label": "Y主刻度数", "type": "number", "default": 0, "span": 3},
+    
+    {"key": "tk_len", "label": "刻度长", "type": "number", "default": 6, "span": 4},
+    {"key": "tk_dir", "label": "刻度朝向", "type": "select", "options": ["in", "out"], "default": "in", "span": 4},
+    {"key": "min_n", "label": "次级分段数", "type": "number", "default": 2, "span": 4},
+
+    {"key": "craw", "label": "Raw 颜色", "type": "string", "default": "#1f77b4", "span": 3},
+    {"key": "ls_raw", "label": "Raw 线型", "type": "select", "options": ["-", "--", "-.", ":"], "default": "-", "span": 3},
+    {"key": "cfit", "label": "Fit 颜色", "type": "string", "default": "#d62728", "span": 3},
+    {"key": "ls_fit", "label": "Fit 线型", "type": "select", "options": ["-", "--", "-.", ":"], "default": "-", "span": 3},
+
+    {"key": "spin_w", "label": "画板宽(inch)", "type": "number", "default": 7.0, "span": 3},
+    {"key": "spin_h", "label": "画板高(inch)", "type": "number", "default": 5.0, "span": 3},
+    {"key": "fs", "label": "基础字号", "type": "number", "default": 12, "span": 3},
+    {"key": "lw", "label": "曲线线宽", "type": "number", "default": 1.5, "span": 3},
+    
+    {"key": "show_txt", "label": "绘制常数", "type": "boolean", "default": True, "span": 3},
+    {"key": "grid", "label": "显示网格", "type": "boolean", "default": False, "span": 3},
+    {"key": "leg", "label": "显示图例", "type": "boolean", "default": True, "span": 3},
+    {"key": "fmt", "label": "输出格式", "type": "select", "options": ["png", "pdf", "svg"], "default": "png", "span": 3},
+    
+    {"key": "b_title", "label": "加粗标题", "type": "boolean", "default": True, "span": 3},
+    {"key": "b_label", "label": "加粗轴名", "type": "boolean", "default": True, "span": 3},
+    {"key": "b_tick", "label": "加粗刻度", "type": "boolean", "default": False, "span": 3},
+    {"key": "b_text", "label": "加粗公式", "type": "boolean", "default": False, "span": 3},
+    
+    {"key": "transparent", "label": "透明背景", "type": "boolean", "default": False, "span": 12}
+]
+
+UI_LAYOUT = {
+    "direction": "row",
+    "blocks": [
+        {"type": "form", "width": "420px", "height": "100%"},
+        {"type": "tabs", "flex": "1", "height": "100%", "panes": [
+            {"title": "👁️ 批量传感拟合画廊", "type": "preview"},
+            {"title": "🎯 核心动力学组学指标", "type": "metrics"},
+            {"title": "💻 算力引擎监控", "type": "terminal"},
+            {"title": "📤 自动化多维归档", "type": "export"}
+        ]}
+    ]
+}
+
+def parse_spr_text(txt_content, k_rx, k_ry, k_fx, k_fy):
+    txt_content = txt_content.replace('\x00', '')
+    lines = txt_content.strip().split('\n')
+    header_idx = -1
+    for i, line in enumerate(lines):
+        l_lower = line.lower()
+        if k_rx.lower() in l_lower or k_ry.lower() in l_lower or k_fx.lower() in l_lower or k_fy.lower() in l_lower:
+            header_idx = i; break
             
-    if not data_rows: return np.array([])
-    return np.array([r + [np.nan]*(max_cols-len(r)) for r in data_rows], dtype=float)
+    raw_rows, headers = [], []
+    if header_idx != -1 and header_idx < len(lines):
+        sep_line = lines[header_idx]
+        if '\t' in sep_line: headers = [x.strip() for x in sep_line.split('\t')]
+        elif ',' in sep_line: headers = [x.strip() for x in sep_line.split(',')]
+        else: headers = [x.strip() for x in sep_line.split()]
+        
+        for line in lines[header_idx+1:]:
+            line = line.strip('\r\n').strip()
+            if not line: continue
+            if '\t' in sep_line: parts = line.split('\t')
+            elif ',' in sep_line: parts = line.split(',')
+            else: parts = line.split()
+            raw_rows.append([p.strip() for p in parts])
+            
+        if raw_rows:
+            max_cols = max(len(headers), max(len(r) for r in raw_rows))
+            if len(headers) < max_cols: headers.extend([f"Col_{i}" for i in range(len(headers), max_cols)])
+            data_body = []
+            for r in raw_rows:
+                r_ext = r + [""] * (max_cols - len(r))
+                data_body.append(r_ext[:max_cols])
+            return pd.DataFrame(data_body, columns=headers)
+    return pd.DataFrame()
+
+def get_sync_workspace():
+    config_file = os.path.abspath(os.path.join(os.path.dirname(__file__), "../sciforge_config.json"))
+    if os.path.exists(config_file):
+        try:
+            with open(config_file, "r", encoding="utf-8") as f:
+                cfg = json.load(f)
+                if cfg.get("data_hub_path"): return cfg.get("data_hub_path")
+        except: pass
+    return os.path.abspath(os.path.join(os.path.dirname(__file__), "../SciForge_Workspace/SciForge_Data"))
 
 def guess_kinetics_times(t, fit):
     idx_max = np.argmax(fit)
@@ -84,9 +151,11 @@ def fit_sck_model(t, y_fit, conc, t_on, t_off, skip=1.5):
     t_a, y_a = t[mask_a], y_fit[mask_a]
     t_d, y_d = t[mask_d], y_fit[mask_d]
     if len(t_a) < 10 or len(t_d) < 10: raise ValueError("有效数据点不足")
+    
     def m_diss(t_arr, kb, R0, off): return R0 * np.exp(-kb * (t_arr - t_off)) + off
     popt_d, _ = curve_fit(m_diss, t_d, y_d, p0=[1e-3, y_d[0], 0], bounds=([1e-6, 0, -np.inf], [1.0, np.inf, np.inf]), maxfev=10000)
     kb_opt = popt_d[0]
+    
     def m_assoc(t_arr, ka, Rmax, Rstart):
         kobs = ka * conc + kb_opt
         Req = (ka * conc * Rmax) / kobs
@@ -100,7 +169,6 @@ def get_spr_texts(ka, kb, kd, is_bold):
         exp = int(np.floor(np.log10(abs(v)))); c = v / (10**exp)
         return r"{0:.2f}\ \times\ 10^{{{1}}}".format(c, exp) if is_bold else r"{0:.2f} \times 10^{{{1}}}".format(c, exp)
     if is_bold:
-        # 修改点 1：将图表公式输出中的 k_b 改为 k_d
         t1 = r"$\mathbf{k_a\ =\ " + fmt(ka) + r"\ M^{-1}s^{-1}}$" + "\n" + r"$\mathbf{k_d\ =\ " + fmt(kb) + r"\ s^{-1}}$"
         if kd == 0 or np.isnan(kd): kd_s = r"0\ M"
         elif kd < 1e-7: kd_s = f"{kd * 1e9:.2f}\\ \\mathrm{{nM}}"
@@ -109,7 +177,6 @@ def get_spr_texts(ka, kb, kd, is_bold):
         else: kd_s = fmt(kd) + r"\ M"
         return t1, r"$\mathbf{K_D\ =\ " + kd_s + r"}$"
     else:
-        # 修改点 2：非加粗版公式输出中将 k_b 改为 k_d
         t1 = r"$k_a = " + fmt(ka) + r"\ \mathrm{M^{-1}s^{-1}}$" + "\n" + r"$k_d = " + fmt(kb) + r"\ \mathrm{s^{-1}}$"
         if kd == 0 or np.isnan(kd): kd_s = r"0\ \mathrm{M}"
         elif kd < 1e-7: kd_s = f"{kd * 1e9:.2f}\\ \\mathrm{{nM}}"
@@ -119,533 +186,179 @@ def get_spr_texts(ka, kb, kd, is_bold):
         return t1, r"$K_D = " + kd_s + r"$"
 
 
-# ==========================================
-# 前端：继承自 BasePluginUI 的 SPR UI (极限紧凑美化)
-# ==========================================
-class SprUI(BasePluginUI):
-    def __init__(self, parent=None, is_setting_mode=False):
-        super().__init__(plugin_id="spr_analyzer", plugin_name="SPR 动力学拟合引擎", parent=parent)
-        self.is_setting_mode = is_setting_mode
-        self.ui_vars = {}
-        self.file_list = []
-        self.setAcceptDrops(True)
-        self._setup_ui()
-        self._load_config()
-
-    def get_float(self, line_edit, default=0.0):
-        try: return float(line_edit.text())
-        except: return default
-
-    def _setup_ui(self):
-        # ========== 左侧参数面板 ==========
-        h_tools = QHBoxLayout()
-        btn_import_config = PushButton("📂 载入模板", icon=FIF.FOLDER)
-        btn_export_config = PushButton("💾 保存模板", icon=FIF.SAVE)
-        btn_import_config.clicked.connect(self.import_config)
-        btn_export_config.clicked.connect(self.export_config)
-        h_tools.addWidget(btn_import_config); h_tools.addWidget(btn_export_config)
-        self.param_layout.insertLayout(0, h_tools)
-
-        if not self.is_setting_mode:
-            gb_data, l_data = self.create_group("1. 数据池 (支持拖拽/右键发送)")
-            btn_row = QHBoxLayout(); btn_row.setContentsMargins(0, 0, 0, 0)
-            btn_add = PrimaryPushButton("导入...", icon=FIF.DOWNLOAD)
-            btn_add.clicked.connect(self.open_files)
-            btn_clear = PushButton("清空", icon=FIF.DELETE)
-            btn_clear.clicked.connect(self.clear_files)
-            btn_row.addWidget(btn_add); btn_row.addWidget(btn_clear)
-            l_data.addLayout(btn_row)
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser()
+    for item in UI_SCHEMA:
+        if item["type"] == "boolean": parser.add_argument(f"--{item['key']}", action="store_true")
+        elif item["type"] == "number": parser.add_argument(f"--{item['key']}", type=float, default=item.get("default", 0.0))
+        else: parser.add_argument(f"--{item['key']}", type=str, default=str(item.get("default", "")))
             
-            self.list_widget = ListWidget()
-            self.list_widget.setFixedHeight(65)
-            self.list_widget.itemClicked.connect(self.trigger_render)
-            l_data.addWidget(self.list_widget)
-            self.add_param_widget(gb_data)
+    args = parser.parse_args()
 
-        gb_wh, l_wh = self.create_group("2. 全局画板尺寸 (英寸)")
-        h_wh = QHBoxLayout(); h_wh.setContentsMargins(0, 0, 0, 0)
-        self.ui_vars['spin_w'] = DoubleSpinBox(); self.ui_vars['spin_w'].setRange(1.0, 50.0); self.ui_vars['spin_w'].setValue(7.0); self.ui_vars['spin_w'].setSingleStep(0.5)
-        self.ui_vars['spin_h'] = DoubleSpinBox(); self.ui_vars['spin_h'].setRange(1.0, 50.0); self.ui_vars['spin_h'].setValue(5.0); self.ui_vars['spin_h'].setSingleStep(0.5)
-        h_wh.addWidget(BodyLabel("W:")); h_wh.addWidget(self.ui_vars['spin_w'], 1)
-        h_wh.addSpacing(5)
-        h_wh.addWidget(BodyLabel("H:")); h_wh.addWidget(self.ui_vars['spin_h'], 1)
-        l_wh.addLayout(h_wh)
-        self.add_param_widget(gb_wh)
+    workspace = get_sync_workspace()
+    temp_dir = os.path.join(workspace, ".cache")
+    os.makedirs(temp_dir, exist_ok=True)
 
-        gb_param, l_param = self.create_group("3. SPR 拟合与样式参数")
-        self.add_param_widget(gb_param)
+    file_paths_str = str(getattr(args, 'file_path', '')).strip()
+    file_list = [f.strip() for f in file_paths_str.split(',') if f.strip()]
+
+    if not file_list:
+        print("❌ [Fatal] 未选中任何文件！"); sys.exit(1)
+
+    print(f">>> 启动 SPR 动力学极速分析引擎，检测到 {len(file_list)} 个任务！")
+    metrics_data = {}
+
+    for f_idx, f_path in enumerate(file_list):
+        print(f"\n--- [Task {f_idx+1}/{len(file_list)}] 处理文件: {f_path} ---")
+        base_name = os.path.splitext(os.path.basename(f_path))[0]
         
-        scroll = QScrollArea()
-        scroll.setWidgetResizable(True)
-        scroll.setFrameShape(QScrollArea.NoFrame)
-        scroll.setStyleSheet("QScrollArea { background: transparent; border: none; }")
-        
-        scroll_content = QWidget()
-        scroll_layout = QVBoxLayout(scroll_content)
-        scroll_layout.setContentsMargins(0, 0, 4, 0) 
-        scroll_layout.setSpacing(4) 
-        u = self.ui_vars
-
-        scroll_layout.addWidget(StrongBodyLabel("数据列映射 (Index)"))
-        u['c_t']=SpinBox(); u['c_t'].setRange(0, 999); u['c_t'].setValue(0)
-        u['c_r']=SpinBox(); u['c_r'].setRange(0, 999); u['c_r'].setValue(1)
-        u['c_f']=SpinBox(); u['c_f'].setRange(0, 999); u['c_f'].setValue(2)
-        h_col=QHBoxLayout(); h_col.setSpacing(4)
-        h_col.addWidget(BodyLabel("Time:")); h_col.addWidget(u['c_t'], 1)
-        h_col.addWidget(BodyLabel("Raw:")); h_col.addWidget(u['c_r'], 1)
-        h_col.addWidget(BodyLabel("Fit:")); h_col.addWidget(u['c_f'], 1)
-        scroll_layout.addLayout(h_col)
-
-        scroll_layout.addSpacing(5)
-        scroll_layout.addWidget(StrongBodyLabel("SCK 动力学拟合参数"))
-        u['conc']=LineEdit(); u['conc'].setText("1e-7")
-        self.add_row(scroll_layout, "最高浓度(M):", u['conc'])
-        
-        u['ton']=LineEdit(); u['ton'].setText("-1")
-        u['toff']=LineEdit(); u['toff'].setText("-1")
-        self.add_row(scroll_layout, "结合(s):", u['ton'], "解离(s):", u['toff'])
-        
-        u['skip']=LineEdit(); u['skip'].setText("1.5")
-        self.add_row(scroll_layout, "跳过波动(s):", u['skip'])
-        
-        lbl_hint = BodyLabel("注: 结合/解离填 -1 开启自动寻峰识别")
-        lbl_hint.setStyleSheet("color:#888; font-size:11px;")
-        scroll_layout.addWidget(lbl_hint)
-
-        if not self.is_setting_mode:
-            scroll_layout.addSpacing(5)
-            scroll_layout.addWidget(StrongBodyLabel("实时计算结果"))
-            u['ka']=LineEdit(); u['ka'].setReadOnly(True)
-            u['kb']=LineEdit(); u['kb'].setReadOnly(True)
-            u['kd']=LineEdit(); u['kd'].setReadOnly(True)
-            # 修改点 3：将 UI 面板上的 "kb:" 标签展示改为 "kd:"，而保持 u['kb'] 的数据绑定不变
-            self.add_row(scroll_layout, "ka:", u['ka']); self.add_row(scroll_layout, "kd:", u['kb']); self.add_row(scroll_layout, "KD:", u['kd'])
-
-        scroll_layout.addSpacing(5)
-        scroll_layout.addWidget(StrongBodyLabel("坐标轴与范围"))
-        u['title']=LineEdit(); u['title'].setText("SPR Kinetics")
-        self.add_row(scroll_layout, "标题:", u['title'])
-        u['xl']=LineEdit(); u['xl'].setText("Time (s)")
-        u['yl']=LineEdit(); u['yl'].setText("Response (RU)")
-        self.add_row(scroll_layout, "X轴名:", u['xl'], "Y轴名:", u['yl'])
-        u['x1']=LineEdit(); u['x2']=LineEdit()
-        self.add_row(scroll_layout, "X范围起:", u['x1'], "止:", u['x2'])
-        u['y1']=LineEdit(); u['y2']=LineEdit()
-        self.add_row(scroll_layout, "Y范围起:", u['y1'], "止:", u['y2'])
-
-        scroll_layout.addSpacing(5)
-        scroll_layout.addWidget(StrongBodyLabel("高级外观样式"))
-        
-        lbl_bold = BodyLabel("独立加粗控制:"); lbl_bold.setStyleSheet("color:#666; font-size:11px;")
-        scroll_layout.addWidget(lbl_bold)
-        
-        h_bold = QHBoxLayout(); h_bold.setSpacing(4)
-        u['b_title'] = CheckBox("标题"); u['b_title'].setChecked(True); h_bold.addWidget(u['b_title'])
-        u['b_label'] = CheckBox("轴名"); u['b_label'].setChecked(True); h_bold.addWidget(u['b_label'])
-        u['b_tick'] = CheckBox("刻度"); h_bold.addWidget(u['b_tick'])
-        u['b_text'] = CheckBox("文本"); h_bold.addWidget(u['b_text'])
-        scroll_layout.addLayout(h_bold)
-        
-        u['craw']=LineEdit(); u['craw'].setText("#1f77b4")
-        u['ls_raw']=ComboBox(); u['ls_raw'].addItems(["-", "--", "-.", ":"])
-        self.add_row(scroll_layout, "Raw色:", u['craw'], "型:", u['ls_raw'])
-        
-        u['cfit']=LineEdit(); u['cfit'].setText("#d62728")
-        u['ls_fit']=ComboBox(); u['ls_fit'].addItems(["-", "--", "-.", ":"])
-        self.add_row(scroll_layout, "Fit色:", u['cfit'], "型:", u['ls_fit'])
-        
-        u['fs']=SpinBox(); u['fs'].setRange(6, 40); u['fs'].setValue(12)
-        h_misc = QHBoxLayout(); h_misc.setSpacing(4)
-        h_misc.addWidget(BodyLabel("全局字号:")); h_misc.addWidget(u['fs'], 1)
-        u['show_txt'] = CheckBox("标注"); u['show_txt'].setChecked(True); h_misc.addWidget(u['show_txt'])
-        u['grid'] = CheckBox("网格"); h_misc.addWidget(u['grid'])
-        scroll_layout.addLayout(h_misc)
-
-        scroll_layout.addStretch()
-        scroll.setWidget(scroll_content)
-        l_param.addWidget(scroll)
-
-        if self.is_setting_mode:
-            self.btn_save_config = PrimaryPushButton("💾 确认并保存为全局默认参数", icon=FIF.SAVE)
-            self.btn_save_config.setFixedHeight(45)
-            self.btn_save_config.clicked.connect(self.save_settings_and_close)
-            self.param_layout.addWidget(self.btn_save_config)
-            return
-
-        self.btn_plot = PrimaryPushButton("⚡ 执行动力学拟合", icon=FIF.PLAY)
-        self.btn_plot.setFixedHeight(35)
-        self.btn_plot.clicked.connect(self.trigger_render)
-        self.param_layout.addWidget(self.btn_plot)
-
-        # ========== 右侧画板 (全新白色原生悬浮质感) ==========
-        self.fig = Figure(dpi=120)
-        self.ax = self.fig.add_subplot(111)
-        self.canvas = FigureCanvas(self.fig)
-        self.canvas.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Fixed)
-        
-        self.canvas_container = QWidget()
-        # ✨ 外观优化：赋予白纸圆角卡片质感
-        self.canvas_container.setStyleSheet("background-color: #FFFFFF; border: 1px solid #EAEAEA; border-radius: 8px;")
-        
-        # 🚨 核心修复：绝对不能使用 self.canvas_layout 覆写基类的布局，否则会引发无限嵌套导致死锁崩溃！
-        canvas_layout = QVBoxLayout(self.canvas_container)
-        canvas_layout.setContentsMargins(10, 10, 10, 10)
-        canvas_layout.setAlignment(Qt.AlignCenter)
-        canvas_layout.addWidget(self.canvas)
-        
-        self.scroll_canvas = QScrollArea()
-        self.scroll_canvas.setWidgetResizable(True)
-        self.scroll_canvas.setFrameShape(QScrollArea.NoFrame)
-        # ✨ 外层透明，融入系统环境
-        self.scroll_canvas.setStyleSheet("QScrollArea { background: transparent; border: none; }")
-        self.scroll_canvas.setWidget(self.canvas_container) 
-        
-        self.toolbar = NavigationToolbar(self.canvas, self)
-        
-        self.get_canvas_layout().addWidget(self.toolbar)
-        self.get_canvas_layout().addWidget(self.scroll_canvas)
-        
-        export_layout = QHBoxLayout()
-        export_layout.addStretch()
-        u['chk_trans'] = CheckBox("透明背景")
-        export_layout.addWidget(u['chk_trans'])
-        export_layout.addSpacing(15)
-        u['combo_fmt'] = ComboBox(); u['combo_fmt'].addItems(["pdf", "png", "svg"])
-        export_layout.addWidget(StrongBodyLabel("导出格式:"))
-        export_layout.addWidget(u['combo_fmt'])
-        btn_export = PushButton("保存图表", icon=FIF.SAVE)
-        btn_export.clicked.connect(self.export_plot)
-        export_layout.addWidget(btn_export)
-        
-        self.get_canvas_layout().addLayout(export_layout)
-
-
-    # ------------------------------------
-    # 数据交互与事件 (维持原有逻辑)
-    # ------------------------------------
-    def dragEnterEvent(self, event):
-        if event.mimeData().hasUrls(): event.accept()
-        else: event.ignore()
-
-    def dropEvent(self, event):
-        for url in event.mimeData().urls():
-            self.load_file(url.toLocalFile())
-
-    def load_file(self, filepath):
-        if not os.path.exists(filepath): return
-        if filepath.lower().endswith(('.csv', '.xlsx', '.xls', '.txt')):
-            if filepath not in self.file_list:
-                self.file_list.append(filepath)
-                if not self.is_setting_mode: self.list_widget.addItem(os.path.basename(filepath))
-        if self.file_list and not self.is_setting_mode and not self.list_widget.currentItem():
-            self.list_widget.setCurrentRow(0)
-            self.trigger_render()
-
-    def open_files(self):
-        files, _ = QFileDialog.getOpenFileNames(self, "选择数据文件", "", "Data Files (*.csv *.xlsx *.xls *.txt);;All Files (*)")
-        for fp in files: self.load_file(fp)
-
-    def clear_files(self):
-        self.file_list.clear()
-        if not self.is_setting_mode:
-            self.list_widget.clear(); self.fig.clear(); self.canvas.draw()
-            self.ui_vars.get('ka', LineEdit()).clear()
-            self.ui_vars.get('kb', LineEdit()).clear()
-            self.ui_vars.get('kd', LineEdit()).clear()
-
-    # ------------------------------------
-    # 统一使用 GlobalConfig 管理设置
-    # ------------------------------------
-    def _save_config(self):
-        config = self.get_config_dict()
-        GlobalConfig.set_all_plugin_settings(self.plugin_id, config)
-
-    def _load_config(self):
-        config = GlobalConfig.get_all_plugin_settings(self.plugin_id)
-        if config:
-            self.apply_config_dict(config)
-
-    def get_config_dict(self):
-        u = self.ui_vars
-        config = {
-            "c_t": u['c_t'].value(), "c_r": u['c_r'].value(), "c_f": u['c_f'].value(),
-            "conc": u['conc'].text(), "ton": u['ton'].text(), "toff": u['toff'].text(), "skip": u['skip'].text(),
-            "title": u['title'].text(), "xl": u['xl'].text(), "yl": u['yl'].text(),
-            "x1": u['x1'].text(), "x2": u['x2'].text(), "y1": u['y1'].text(), "y2": u['y2'].text(),
-            "spin_w": u['spin_w'].value(), "spin_h": u['spin_h'].value(),
-            "b_title": u['b_title'].isChecked(), "b_label": u['b_label'].isChecked(), "b_tick": u['b_tick'].isChecked(), "b_text": u['b_text'].isChecked(),
-            "craw": u['craw'].text(), "ls_raw": u['ls_raw'].currentText(),
-            "cfit": u['cfit'].text(), "ls_fit": u['ls_fit'].currentText(),
-            "fs": u['fs'].value(), "show_txt": u['show_txt'].isChecked(), "grid": u['grid'].isChecked()
-        }
-        if not self.is_setting_mode:
-            config["chk_trans"] = u['chk_trans'].isChecked()
-            config["combo_fmt"] = u['combo_fmt'].currentText()
-        return config
-
-    def apply_config_dict(self, data):
-        u = self.ui_vars
-        u['c_t'].setValue(data.get("c_t", 0)); u['c_r'].setValue(data.get("c_r", 1)); u['c_f'].setValue(data.get("c_f", 2))
-        u['conc'].setText(data.get("conc", "1e-7")); u['ton'].setText(data.get("ton", "-1")); u['toff'].setText(data.get("toff", "-1")); u['skip'].setText(data.get("skip", "1.5"))
-        u['title'].setText(data.get("title", "SPR Kinetics")); u['xl'].setText(data.get("xl", "Time (s)")); u['yl'].setText(data.get("yl", "Response (RU)"))
-        u['x1'].setText(data.get("x1", "")); u['x2'].setText(data.get("x2", "")); u['y1'].setText(data.get("y1", "")); u['y2'].setText(data.get("y2", ""))
-        u['spin_w'].setValue(data.get("spin_w", 7.0)); u['spin_h'].setValue(data.get("spin_h", 5.0))
-        u['b_title'].setChecked(data.get("b_title", True)); u['b_label'].setChecked(data.get("b_label", True)); u['b_tick'].setChecked(data.get("b_tick", False)); u['b_text'].setChecked(data.get("b_text", False))
-        u['craw'].setText(data.get("craw", "#1f77b4")); u['ls_raw'].setCurrentText(data.get("ls_raw", "-"))
-        u['cfit'].setText(data.get("cfit", "#d62728")); u['ls_fit'].setCurrentText(data.get("ls_fit", "-"))
-        u['fs'].setValue(data.get("fs", 12)); u['show_txt'].setChecked(data.get("show_txt", True)); u['grid'].setChecked(data.get("grid", False))
-        
-        if not self.is_setting_mode and "chk_trans" in u:
-            u['chk_trans'].setChecked(data.get("chk_trans", False))
-            u['combo_fmt'].setCurrentText(data.get("combo_fmt", "pdf"))
-
-    def export_config(self):
-        path, _ = QFileDialog.getSaveFileName(self, "保存 SPR 参数模板", "spr_template.json", "JSON Files (*.json)")
-        if path:
-            with open(path, 'w', encoding='utf-8') as f: json.dump(self.get_config_dict(), f, indent=4)
-            QMessageBox.information(self, "成功", "模板保存成功！")
-
-    def import_config(self):
-        path, _ = QFileDialog.getOpenFileName(self, "载入 SPR 参数模板", "", "JSON Files (*.json)")
-        if path:
-            with open(path, 'r', encoding='utf-8') as f: self.apply_config_dict(json.load(f))
-            if not self.is_setting_mode: self.trigger_render()
-
-    def save_settings_and_close(self):
-        self._save_config()
-        parent_dlg = self.window()
-        if isinstance(parent_dlg, QDialog): parent_dlg.accept()
-
-    def trigger_render(self, *args):
-        if self.is_setting_mode: return
-        self._save_config()
-        self.render_plot()
-        
-        dpi = self.fig.dpi
-        w_px = int(self.ui_vars['spin_w'].value() * dpi)
-        h_px = int(self.ui_vars['spin_h'].value() * dpi)
-        self.canvas.setFixedSize(w_px, h_px)
-        self.canvas_container.updateGeometry()
-
-    def export_plot(self):
-        if self.is_setting_mode: return
-        fmt = self.ui_vars['combo_fmt'].currentText()
-        is_transparent = self.ui_vars['chk_trans'].isChecked()
-        row = self.list_widget.currentRow()
-        default_name = os.path.splitext(self.list_widget.item(max(0,row)).text())[0] + f"_SPR.{fmt}" if self.list_widget.count() > 0 else f"SPR_Plot.{fmt}"
-        file_path, _ = QFileDialog.getSaveFileName(self, "导出图表", default_name, f"Images (*.{fmt})")
-        if file_path:
-            try:
-                self.fig.savefig(file_path, dpi=600, bbox_inches="tight", transparent=is_transparent)
-                QMessageBox.information(self, "成功", f"图表已导出:\n{file_path}")
-            except Exception as e: QMessageBox.critical(self, "导出失败", str(e))
-
-    def render_plot(self):
-        if self.is_setting_mode: return
-        row = self.list_widget.currentRow()
-        if row < 0 or row >= len(self.file_list): return
-        fp = self.file_list[row]
-        title_text = os.path.splitext(os.path.basename(fp))[0]
-        
-        self.fig.clear()
-        u = self.ui_vars
-        self.fig.set_size_inches(u['spin_w'].value(), u['spin_h'].value())
-        self.ax = self.fig.add_subplot(111)
-        
-        data = safe_load_array(fp)
-        if data.size == 0: return
-        
-        max_col = max(u['c_t'].value(), u['c_r'].value(), u['c_f'].value())
-        if data.shape[1] <= max_col:
-            self.ax.text(0.5, 0.5, f"数据列不足！请检查 Index 设置\n最大列数需 > {max_col}", ha='center', va='center')
-            self.canvas.draw()
-            return
-            
-        t, raw, fit = data[:, u['c_t'].value()], data[:, u['c_r'].value()], data[:, u['c_f'].value()]
-        mask = ~np.isnan(t) & ~np.isnan(fit)
-        t, raw, fit = t[mask], raw[mask], fit[mask]
-        
-        conc = self.get_float(u['conc'], 1e-7)
-        t_on = self.get_float(u['ton'], -1)
-        t_off = self.get_float(u['toff'], -1)
-        skip_val = self.get_float(u['skip'], 1.5)
-        
-        if t_on < 0 or t_off < 0:
-            t_on, t_off = guess_kinetics_times(t, fit)
-            u['ton'].setText(f"{t_on:.1f}")
-            u['toff'].setText(f"{t_off:.1f}")
-        
-        try: 
-            ka, kb, kd = fit_sck_model(t, fit, conc, t_on, t_off, skip=skip_val)
-        except: 
-            ka, kb, kd = 0, 0, 0
-        
-        u['ka'].setText(f"{ka:.2e}")
-        u['kb'].setText(f"{kb:.2e}")
-        u['kd'].setText(f"{kd:.2e}")
-        
-        fs = u['fs'].value()
-        fw_title = 'bold' if u['b_title'].isChecked() else 'normal'
-        fw_label = 'bold' if u['b_label'].isChecked() else 'normal'
-        fw_tick  = 'bold' if u['b_tick'].isChecked() else 'normal'
-        fw_text  = 'bold' if u['b_text'].isChecked() else 'normal'
-
-        self.ax.plot(t, raw, color=u['craw'].text(), lw=1.5, ls=u['ls_raw'].currentText(), label="Raw Data")
-        self.ax.plot(t, fit, color=u['cfit'].text(), lw=2.0, ls=u['ls_fit'].currentText(), label="Fitted Curve")
-        
-        if u['show_txt'].isChecked():
-            txt_1, txt_2 = get_spr_texts(ka, kb, kd, is_bold=u['b_text'].isChecked())
-            self.ax.text(0.05, 0.95, txt_1, transform=self.ax.transAxes, fontsize=fs-1, va='top', fontweight=fw_text)
-            self.ax.text(0.95, 0.05, txt_2, transform=self.ax.transAxes, fontsize=fs-1, va='bottom', ha='right', fontweight=fw_text)
-
-        self.ax.set_xlabel(u['xl'].text(), fontsize=fs, fontweight=fw_label)
-        self.ax.set_ylabel(u['yl'].text(), fontsize=fs, fontweight=fw_label)
-        self.ax.set_title(u['title'].text() if u['title'].text() else title_text, fontsize=fs+2, fontweight=fw_title, pad=10)
-        
-        if u['x1'].text(): self.ax.set_xlim(left=self.get_float(u['x1']))
-        if u['x2'].text(): self.ax.set_xlim(right=self.get_float(u['x2']))
-        if u['y1'].text(): self.ax.set_ylim(bottom=self.get_float(u['y1']))
-        if u['y2'].text(): self.ax.set_ylim(top=self.get_float(u['y2']))
-
-        self.ax.tick_params(which='major', labelsize=fs-1)
-        for label in self.ax.get_xticklabels() + self.ax.get_yticklabels(): label.set_fontweight(fw_tick)
-
-        self.ax.spines['top'].set_visible(False)
-        self.ax.spines['right'].set_visible(False)
-        for sp in self.ax.spines.values(): sp.set_linewidth(1.5)
-            
-        if u['grid'].isChecked():
-            self.ax.grid(True, which='major', ls='--', alpha=0.5)
-        
-        self.fig.tight_layout()
-        self.canvas.draw()
-
-
-# ==========================================
-# 后端：插件描述器与全局入口联动
-# ==========================================
-class SPRPlugin(BasePlugin):
-    plugin_id = "spr_analyzer"
-    plugin_name = "SPR 动力学拟合引擎"
-    icon = "📈"
-
-    trigger_tag = "SPR"
-    
-    def get_ui(self, parent=None):
-        return SprUI(parent, is_setting_mode=False)
-
-    def get_setting_card(self, parent=None):
-        from qfluentwidgets import PrimaryPushSettingCard, FluentIcon as FIF
-        from PyQt5.QtWidgets import QDialog, QVBoxLayout
-
-        card = PrimaryPushSettingCard(
-            "配置全局默认参数", 
-            FIF.EDIT, 
-            "📈 SPR 动力学分析", 
-            "修改工作站中 SPR 传感图的默认列索引、寻峰规则与动力学常数展示外观", 
-            parent
-        )
-
-        def show_global_settings_dialog():
-            dlg = QDialog(card) 
-            dlg.setWindowTitle("SPR 全局默认参数预设中心")
-            dlg.resize(460, 750) 
-            dlg.setStyleSheet("QDialog { background-color: #F9F9F9; }")
-            layout = QVBoxLayout(dlg)
-            
-            settings_ui = SprUI(dlg, is_setting_mode=True)
-            layout.addWidget(settings_ui)
-            dlg.exec_()
-
-        card.clicked.connect(show_global_settings_dialog)
-        return card
-
-    @staticmethod
-    def run(file_path, archive_dir):
-        """后台自动化处理逻辑"""
         try:
-            config = GlobalConfig.get_all_plugin_settings("spr_analyzer")
-            u = config if config else {}
+            in_file = os.path.join(workspace, f_path)
+            if not os.path.exists(in_file): raise Exception("找不到文件")
             
-            c_t = u.get("c_t", 0)
-            c_r = u.get("c_r", 1)
-            c_f = u.get("c_f", 2)
-            conc = float(u.get("conc", 1e-7))
-            t_on = float(u.get("ton", -1))
-            t_off = float(u.get("toff", -1))
-            skip_val = float(u.get("skip", 1.5))
+            df = pd.DataFrame()
+            if in_file.lower().endswith(('.xlsx', '.xls')):
+                df = pd.read_excel(in_file).apply(pd.to_numeric, errors='coerce').dropna(axis=0, how='all')
+            else:
+                for enc in ["utf-16", "utf-8-sig", "utf-8", "gbk", "latin1"]:
+                    try:
+                        with open(in_file, 'r', encoding=enc, errors='ignore') as f: content = f.read()
+                        df = parse_spr_text(content, args.k_raw_x, args.k_raw_y, args.k_fit_x, args.k_fit_y)
+                        if not df.empty: break
+                    except: continue
+
+            if df.empty: raise Exception("智能嗅探失败，未发现包含特征关键词的数字矩阵")
+
+            rx_idx, ry_idx = int(args.c_rx), int(args.c_ry)
+            fx_idx, fy_idx = int(args.c_fx), int(args.c_fy)
+
+            if args.auto_col:
+                found_rx = found_ry = found_fx = found_fy = False
+                for i, col in enumerate(df.columns):
+                    c_str = str(col).strip().lower()
+                    if not found_rx and args.k_raw_x.lower() in c_str: rx_idx = i; found_rx = True
+                    elif not found_ry and args.k_raw_y.lower() in c_str: ry_idx = i; found_ry = True
+                    elif not found_fx and args.k_fit_x.lower() in c_str: fx_idx = i; found_fx = True
+                    elif not found_fy and args.k_fit_y.lower() in c_str: fy_idx = i; found_fy = True
+
+            def extract_float_pair(d, idx_x, idx_y):
+                if idx_x >= len(d.columns) or idx_y >= len(d.columns) or idx_x < 0 or idx_y < 0:
+                    return np.array([]), np.array([])
+                vx = pd.to_numeric(d.iloc[:, idx_x], errors='coerce').values
+                vy = pd.to_numeric(d.iloc[:, idx_y], errors='coerce').values
+                valid = ~np.isnan(vx) & ~np.isnan(vy)
+                return vx[valid], vy[valid]
+
+            t_raw, y_raw = extract_float_pair(df, rx_idx, ry_idx)
+            t_fit, y_fit = extract_float_pair(df, fx_idx, fy_idx)
+            if len(t_raw) == 0: raise Exception("未能提取到有效的 Raw 数据")
+
+            fit_t = t_fit if len(t_fit) > 0 else t_raw
+            fit_y = y_fit if len(y_fit) > 0 else y_raw
+
+            try: conc = float(args.conc)
+            except: conc = 1e-7
             
-            data = safe_load_array(file_path)
-            max_col = max(c_t, c_r, c_f)
-            if data.size == 0 or data.shape[1] <= max_col:
-                return "", "【SPR分析跳过】数据为空或列数不足（请检查 Index 映射）。"
-            
-            t, raw, fit = data[:, c_t], data[:, c_r], data[:, c_f]
-            mask = ~np.isnan(t) & ~np.isnan(fit)
-            t, raw, fit = t[mask], raw[mask], fit[mask]
-            
-            if t_on < 0 or t_off < 0:
-                t_on, t_off = guess_kinetics_times(t, fit)
-                
-            try:
-                ka, kb, kd = fit_sck_model(t, fit, conc, t_on, t_off, skip=skip_val)
-            except Exception:
-                ka, kb, kd = 0, 0, 0
-                
-            from matplotlib.figure import Figure
-            from matplotlib.backends.backend_agg import FigureCanvasAgg
-            import matplotlib.pyplot as plt
-            
-            plt.rcParams['font.sans-serif'] = ['SimHei', 'Microsoft YaHei']
+            t_on, t_off = args.ton, args.toff
+            if t_on < 0 or t_off < 0: t_on, t_off = guess_kinetics_times(fit_t, fit_y)
+
+            ka, kb, kd = 0, 0, 0
+            try: 
+                ka, kb, kd = fit_sck_model(fit_t, fit_y, conc, t_on, t_off, skip=args.skip)
+                metrics_data[f"[{base_name}] ka"] = f"{ka:.2e} M⁻¹s⁻¹"
+                metrics_data[f"[{base_name}] kd"] = f"{kb:.2e} s⁻¹"
+                metrics_data[f"[{base_name}] KD"] = f"{kd:.2e} M"
+            except Exception as fit_err: pass
+
+            plt.rcParams['font.sans-serif'] = ['Arial', 'SimHei', 'DejaVu Sans']
             plt.rcParams['axes.unicode_minus'] = False
-            
-            fig = Figure(figsize=(u.get("spin_w", 7.0), u.get("spin_h", 5.0)), dpi=150)
-            canvas = FigureCanvasAgg(fig)
+            fs, lw = args.fs, args.lw
+            fw_title = 'bold' if getattr(args, 'b_title', True) else 'normal'
+            fw_label = 'bold' if getattr(args, 'b_label', True) else 'normal'
+            fw_tick  = 'bold' if getattr(args, 'b_tick', False) else 'normal'
+            fw_text  = 'bold' if getattr(args, 'b_text', False) else 'normal'
+
+            fig = plt.figure(figsize=(args.spin_w, args.spin_h), dpi=150)
             ax = fig.add_subplot(111)
-            
-            fs = u.get("fs", 12)
-            fw_title = 'bold' if u.get("b_title", True) else 'normal'
-            fw_label = 'bold' if u.get("b_label", True) else 'normal'
-            fw_tick  = 'bold' if u.get("b_tick", False) else 'normal'
-            fw_text  = 'bold' if u.get("b_text", False) else 'normal'
 
-            ax.plot(t, raw, color=u.get("craw", "#1f77b4"), lw=1.5, ls=u.get("ls_raw", "-"), label="Raw Data")
-            ax.plot(t, fit, color=u.get("cfit", "#d62728"), lw=2.0, ls=u.get("ls_fit", "-"), label="Fitted Curve")
-            
-            if u.get("show_txt", True):
-                txt_1, txt_2 = get_spr_texts(ka, kb, kd, is_bold=u.get("b_text", False))
-                ax.text(0.05, 0.95, txt_1, transform=ax.transAxes, fontsize=fs-1, va='top', fontweight=fw_text)
-                ax.text(0.95, 0.05, txt_2, transform=ax.transAxes, fontsize=fs-1, va='bottom', ha='right', fontweight=fw_text)
+            ax.plot(t_raw, y_raw, color=args.craw, lw=lw, ls=args.ls_raw, label="Raw Data", zorder=2)
+            if len(t_fit) > 0: ax.plot(t_fit, y_fit, color=args.cfit, lw=lw+0.5, ls=args.ls_fit, label="Fitted Curve", zorder=3)
 
-            title_text = os.path.splitext(os.path.basename(file_path))[0]
-            ax.set_xlabel(u.get("xl", "Time (s)"), fontsize=fs, fontweight=fw_label)
-            ax.set_ylabel(u.get("yl", "Response (RU)"), fontsize=fs, fontweight=fw_label)
-            ax.set_title(u.get("title", "SPR Kinetics") if u.get("title", "") else title_text, fontsize=fs+2, fontweight=fw_title, pad=10)
-            
-            if u.get("x1", ""): ax.set_xlim(left=float(u["x1"]))
-            if u.get("x2", ""): ax.set_xlim(right=float(u["x2"]))
-            if u.get("y1", ""): ax.set_ylim(bottom=float(u["y1"]))
-            if u.get("y2", ""): ax.set_ylim(top=float(u["y2"]))
+            if getattr(args, 'show_txt', True) and ka > 0:
+                txt_1, txt_2 = get_spr_texts(ka, kb, kd, is_bold=getattr(args, 'b_text', False))
+                ax.text(0.05, 0.95, txt_1, transform=ax.transAxes, fontsize=fs-1, va='top', fontweight=fw_text, zorder=4)
+                ax.text(0.95, 0.05, txt_2, transform=ax.transAxes, fontsize=fs-1, va='bottom', ha='right', fontweight=fw_text, zorder=4)
 
-            ax.tick_params(which='major', labelsize=fs-1)
+            plot_title = base_name if args.title == "SPR Kinetics" else f"{base_name} - {args.title}"
+            ax.set_title(plot_title, fontsize=fs+2, fontweight=fw_title, pad=10)
+
+            ax.set_xlabel(args.xl, fontsize=fs, fontweight=fw_label)
+            ax.set_ylabel(args.yl, fontsize=fs, fontweight=fw_label)
+
+            if args.x1 != "": ax.set_xlim(left=float(args.x1))
+            if args.x2 != "": ax.set_xlim(right=float(args.x2))
+            if args.y1 != "": ax.set_ylim(bottom=float(args.y1))
+            if args.y2 != "": ax.set_ylim(top=float(args.y2))
+
+            try:
+                xt_step, xt_n = float(getattr(args, 'xt_step', 0)), float(getattr(args, 'xt_n', 0))
+                if xt_step > 0: ax.xaxis.set_major_locator(MultipleLocator(xt_step))
+                elif xt_n > 0: ax.xaxis.set_major_locator(MaxNLocator(int(xt_n)))
+                yt_step, yt_n = float(getattr(args, 'yt_step', 0)), float(getattr(args, 'yt_n', 0))
+                if yt_step > 0: ax.yaxis.set_major_locator(MultipleLocator(yt_step))
+                elif yt_n > 0: ax.yaxis.set_major_locator(MaxNLocator(int(yt_n)))
+            except: pass
+
+            tk_len = int(getattr(args, 'tk_len', 6))
+            tk_dir = getattr(args, 'tk_dir', "in")
+            min_n = int(getattr(args, 'min_n', 2))
+
+            ax.tick_params(which='major', width=lw, length=tk_len, labelsize=fs-1, direction=tk_dir)
+            ax.tick_params(which='minor', width=lw*0.7, length=tk_len*0.6, direction=tk_dir)
+            if min_n > 0:
+                ax.xaxis.set_minor_locator(AutoMinorLocator(min_n))
+                ax.yaxis.set_minor_locator(AutoMinorLocator(min_n))
+            else:
+                ax.xaxis.set_minor_locator(NullLocator())
+                ax.yaxis.set_minor_locator(NullLocator())
+
             for label in ax.get_xticklabels() + ax.get_yticklabels(): label.set_fontweight(fw_tick)
-
-            ax.spines['top'].set_visible(False)
-            ax.spines['right'].set_visible(False)
             for sp in ax.spines.values(): sp.set_linewidth(1.5)
-                
-            if u.get("grid", False):
-                ax.grid(True, which='major', ls='--', alpha=0.5)
-            
+            ax.spines['top'].set_visible(False); ax.spines['right'].set_visible(False)
+            if getattr(args, 'grid', False): ax.grid(True, which='major', ls='--', alpha=0.5)
+            if getattr(args, 'leg', True): ax.legend(frameon=False, fontsize=fs-1, loc='best')
             fig.tight_layout()
+
+            uid = uuid.uuid4().hex[:4]
+            ext = getattr(args, 'fmt', 'png') 
+            img_name = f"Out_SPR_{base_name}_{uid}.{ext}"
+            csv_name = f"Out_SPR_{base_name}_{uid}.csv"
             
-            out_name = f"plot_SPR_{os.path.basename(file_path)}.png"
-            out_path = os.path.join(archive_dir, out_name)
-            fig.savefig(out_path, dpi=150)
-            fig.clf()
+            img_path = os.path.join(temp_dir, img_name)
+            csv_path = os.path.join(temp_dir, csv_name)
             
-            # 修改点 4：输出的结果摘要中将 kb 改为 kd
-            return out_path, f"🔬 【SPR 动力学拟合完毕】<br>计算结果: ka={ka:.2e}, kd={kb:.2e}, KD={kd:.2e}"
+            # --- 保存时带上透明选项 ---
+            is_transparent = getattr(args, 'transparent', False)
+            fig.savefig(img_path, dpi=300, bbox_inches='tight', transparent=is_transparent)
+            plt.close(fig)
             
-        except Exception as e:
-            return "", f"SPR 自动作图引擎执行失败: {str(e)}"
+            df_export = pd.DataFrame({"Time (s)": t_raw, "Raw Response": y_raw})
+            if len(t_fit) > 0: 
+                min_len = min(len(t_raw), len(t_fit))
+                df_export = df_export.iloc[:min_len].copy()
+                df_export["Fitted Response"] = y_fit[:min_len]
+
+            df_export.to_csv(csv_path, index=False)
+
+            print(f"[OutputFile] .cache/{img_name}")
+            print(f"[OutputTable] .cache/{csv_name}")
+            print(f"✅ {base_name} 处理成功！")
+            
+        except Exception as proc_err:
+            print(f"❌ {base_name} 崩溃跳过: {proc_err}")
+
+    if metrics_data:
+        print(f"[OutputMetrics] {json.dumps(metrics_data, ensure_ascii=False)}")
+        
+    print("\n[Success] 批量分析流水线全部执行完毕！")
+    sys.exit(0)

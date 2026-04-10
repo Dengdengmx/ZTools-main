@@ -1,26 +1,19 @@
 # plugins/plugin_dynamic_matcher.py
-"""
-RFdiffusion & ProteinMPNN 变长设计与动态匹配器插件
-用于在 SciForge 中进行结构设计的多链约束、拓扑规划、批处理脚本生成与动态对齐。
-"""
-
 import os
+import sys
+import argparse
 import json
-import glob
-import html
-from PyQt5.QtCore import Qt
-from PyQt5.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QFileDialog, 
-                             QStackedWidget, QMessageBox, QDialog)
-from PyQt5.QtGui import QFont
+import tarfile
 
-from qfluentwidgets import (LineEdit, SpinBox, CheckBox, ComboBox,
-                            BodyLabel, PushButton, PrimaryPushButton,
-                            StrongBodyLabel, TextEdit, PlainTextEdit, 
-                            Pivot, FluentIcon as FIF, PrimaryPushSettingCard, ToolButton)
+try:
+    import paramiko
+    HAS_SSH = True
+except ImportError:
+    HAS_SSH = False
 
-from core.plugin_manager import BasePlugin
-from core.ui_base import BasePluginUI
-from core.config import GlobalConfig
+PLUGIN_NAME = "变长设计与动态匹配引擎 (云端两段式版)"
+PLUGIN_ICON = "🧬"
+PLUGIN_DESC = "用于变长 Scaffold/Contig 设计。先运行 RF 拉回结果，人工挑选骨架后，再执行动态序列匹配生成精准的约束跑 MPNN。自带编译后序列比对视图！"
 
 AA_MAP = {
     'ALA': 'A', 'ARG': 'R', 'ASN': 'N', 'ASP': 'D', 'CYS': 'C',
@@ -29,760 +22,708 @@ AA_MAP = {
     'SER': 'S', 'THR': 'T', 'TRP': 'W', 'TYR': 'Y', 'VAL': 'V'
 }
 
+# ==========================================
+# 前端表单 UI Schema 描述
+# ==========================================
+UI_SCHEMA = [
+    {"key": "two_stage", "label": "🔀 开启两段式交互 (变长匹配原理级强制要求开启)", "type": "boolean", "default": True, "span": 12},
+    
+    {"key": "orig_pdb", "label": "📁 第一阶段：原始骨架/靶点 (WT) PDB (必填)", "type": "file", "span": 12},
+    {"key": "rfd_pdbs", "label": "📁 第二阶段：挑选满意的 RF 骨架用于 MPNN (多选)", "type": "file", "span": 12},
 
-class DynamicMatcherUI(BasePluginUI):
-    def __init__(self, parent=None, is_setting_mode=False):
-        super().__init__(plugin_id="dynamic_matcher", plugin_name="变长设计与动态匹配引擎", parent=parent)
-        self.is_setting_mode = is_setting_mode
-        self.orig_pdb_path = ""
-        self.pdb_data_dict = {}
-        self.generated_fixed_data = {}
-        self.generated_bias_data = {}
-        self.generated_omit_data = {}
-        
-        self._setup_ui()
-        self._load_config()
+    {"key": "mode", "label": "设计模式", "type": "select", "options": [
+        "Partial Diffusion (局部微调/构象锁定)", 
+        "Motif Scaffolding (变长与搭桥)", 
+        "Binder Design (蛋白结合子设计)", 
+        "Unconditional (De novo)"
+    ], "default": "Motif Scaffolding (变长与搭桥)", "span": 12},
 
-    def _setup_ui(self):
-        action_layout = QVBoxLayout()
-        btn_rfd = PushButton("⚙️ 1. 验证约束并编译 RF")
-        btn_mpnn = PushButton("🚀 2. 匹配并编译 MPNN")
-        btn_export = PrimaryPushButton("💾 3. 智能按需导出所有配置")
-        
-        btn_rfd.clicked.connect(self.compile_rfd_step)
-        btn_mpnn.clicked.connect(self.compile_mpnn_step)
-        btn_export.clicked.connect(self.export_all)
-        
-        action_layout.addWidget(btn_rfd)
-        action_layout.addWidget(btn_mpnn)
-        action_layout.addWidget(btn_export)
-        self.param_layout.insertLayout(0, action_layout)
-        self.param_layout.insertSpacing(1, 15)
+    {"key": "contig", "label": "Contig 拓扑 (原链名)", "type": "string", "default": "[A1-150/0 B1-200/10-10/B211-452]", "span": 12},
+    {"key": "bias", "label": "偏好突变 (如: A15:W)", "type": "string", "default": "", "span": 6},
+    {"key": "fixed", "label": "锁定不变 (如: A, B1-50)", "type": "string", "default": "A, B1-770", "span": 6},
 
-        grp_io, lyt_io = self.create_group("1. 模式与本地数据交互")
-        self.combo_mode = ComboBox()
-        self.combo_mode.addItems(["Partial Diffusion (仅限严格定长微调)", 
-                                  "Motif Scaffolding (变长与搭桥推荐)", 
-                                  "Binder Design (蛋白结合子设计)", 
-                                  "Unconditional (De novo)"])
-        self.combo_mode.setCurrentText("Motif Scaffolding (变长与搭桥推荐)")
-        self.add_row(lyt_io, "设计模式:", self.combo_mode)
-        
-        self.input_orig_pdb = LineEdit()
-        # 🌟 修复点 2：必须使用 ToolButton
-        btn_load_pdb = ToolButton(FIF.FOLDER)
-        btn_load_pdb.setFixedWidth(40)
-        btn_load_pdb.clicked.connect(self.load_orig_pdb)
-        self.add_row(lyt_io, "原始 PDB:", self.input_orig_pdb, None, btn_load_pdb)
-        
-        self.input_rf_dir = LineEdit()
-        btn_load_rf = ToolButton(FIF.FOLDER)
-        btn_load_rf.setFixedWidth(40)
-        btn_load_rf.clicked.connect(self.select_rf_dir)
-        self.add_row(lyt_io, "RF 输出目录:", self.input_rf_dir, None, btn_load_rf)
-        self.add_param_widget(grp_io)
+    {"key": "hotspot", "label": "靶点热区 (Binder模式)", "type": "string", "default": "", "span": 6},
+    {"key": "partial_t", "label": "扰动强度 (Partial模式)", "type": "string", "default": "15", "span": 6},
+    {"key": "ss_bias", "label": "二级结构约束 (SS Bias)", "type": "string", "default": "", "span": 6},
+    {"key": "num_designs", "label": "RF 生成批次", "type": "number", "default": 10, "span": 6},
 
-        grp_topo, lyt_topo = self.create_group("2. 拓扑与约束 (基于原始 PDB 编号)")
-        self.input_contig = LineEdit()
-        self.input_contig.setText("[A1-150/0 B1-200/10-10/B211-452]")
-        self.add_row(lyt_topo, "Contig:", self.input_contig)
-        
-        self.input_bias = LineEdit()
-        self.input_bias.setText("B771:P, A150:C")
-        self.add_row(lyt_topo, "偏好突变:", self.input_bias)
-        
-        self.input_fixed = LineEdit()
-        self.input_fixed.setText("A, B53-63, B80-120")
-        self.add_row(lyt_topo, "锁定不变:", self.input_fixed)
-        self.add_param_widget(grp_topo)
+    {"key": "omit_aa", "label": "MPNN 禁用氨基酸", "type": "string", "default": "C", "span": 6},
+    {"key": "seq_per_target", "label": "MPNN 每骨架序列数", "type": "number", "default": 2, "span": 6},
+    {"key": "ss_enhance", "label": "🛡️ 开启二级结构保护 (禁止螺旋/折叠出 P/G)", "type": "boolean", "default": True, "span": 12},
 
-        grp_rfd, lyt_rfd = self.create_group("3. RFdiffusion 引擎参数")
-        self.input_hotspot = LineEdit()
-        self.add_row(lyt_rfd, "靶点热区:", self.input_hotspot)
-        
-        self.input_partial_t = LineEdit()
-        self.input_partial_t.setText("15")
-        self.add_row(lyt_rfd, "扰动强度:", self.input_partial_t)
-        
-        self.input_ss_bias = LineEdit()
-        self.add_row(lyt_rfd, "SS 约束:", self.input_ss_bias)
-        
-        self.input_num_designs = LineEdit()
-        self.input_num_designs.setText("50")
-        self.add_row(lyt_rfd, "生成批次:", self.input_num_designs)
-        self.add_param_widget(grp_rfd)
+    {"key": "ssh_host", "label": "云端 IP", "type": "string", "default": "192.168.1.100", "span": 4},
+    {"key": "ssh_port", "label": "端口", "type": "number", "default": 22, "span": 2},
+    {"key": "ssh_user", "label": "用户名", "type": "string", "default": "root", "span": 3},
+    {"key": "ssh_pwd", "label": "云端密码", "type": "string", "default": "", "span": 3},
 
-        grp_mpnn, lyt_mpnn = self.create_group("4. ProteinMPNN 引擎参数")
-        self.input_omit_aa = LineEdit()
-        self.input_omit_aa.setText("C")
-        self.add_row(lyt_mpnn, "禁用氨基酸:", self.input_omit_aa)
-        
-        self.input_seq_per_target = LineEdit()
-        self.input_seq_per_target.setText("10")
-        self.add_row(lyt_mpnn, "骨架生成数:", self.input_seq_per_target)
-        
-        self.chk_ss_enhance = CheckBox("🛡️ 启用二级结构保护 (禁止在螺旋/折叠区产生P/G)")
-        self.chk_ss_enhance.setChecked(True)
-        lyt_mpnn.addWidget(self.chk_ss_enhance)
-        self.add_param_widget(grp_mpnn)
+    {"key": "conda_sh", "label": "Conda 路径", "type": "string", "default": "/opt/conda/etc/profile.d/conda.sh", "span": 12},
+    {"key": "rfd_env", "label": "RF 环境名", "type": "string", "default": "SE3nv", "span": 6},
+    {"key": "mpnn_env", "label": "MPNN 环境名", "type": "string", "default": "mlfold", "span": 6},
+    
+    {"key": "rfd_path", "label": "RF 推理脚本路径", "type": "string", "default": "/home/user/RFdiffusion/scripts/run_inference.py", "span": 12},
+    {"key": "mpnn_path", "label": "MPNN 运行脚本路径", "type": "string", "default": "/home/user/ProteinMPNN/protein_mpnn_run.py", "span": 12},
+    
+    {"key": "server_dir", "label": "云端工作流根目录", "type": "string", "default": "/home/user/ztools_workspace/", "span": 8},
+    {"key": "gpu_id", "label": "GPU ID", "type": "string", "default": "0", "span": 4}
+]
 
-        grp_env, lyt_env = self.create_group("5. 服务器运行环境设定")
-        self.input_conda_sh = LineEdit()
-        self.input_conda_sh.setText("~/.bashrc")
-        self.add_row(lyt_env, "Conda:", self.input_conda_sh)
-        
-        self.input_rfd_env = LineEdit(); self.input_rfd_env.setText("SE3nv")
-        self.input_mpnn_env = LineEdit(); self.input_mpnn_env.setText("mlfold")
-        self.add_row(lyt_env, "RF Env:", self.input_rfd_env, "MP Env:", self.input_mpnn_env)
-        
-        self.input_rfd_path = LineEdit()
-        self.input_rfd_path.setText("/home/user/RFdiffusion/scripts/run_inference.py")
-        self.add_row(lyt_env, "RF 脚本:", self.input_rfd_path)
-        
-        self.input_mpnn_path = LineEdit()
-        self.input_mpnn_path.setText("/home/user/ProteinMPNN/protein_mpnn_run.py")
-        self.add_row(lyt_env, "MP 脚本:", self.input_mpnn_path)
-        
-        self.input_server_dir = LineEdit()
-        self.input_server_dir.setText("/home/user/my_project/")
-        self.add_row(lyt_env, "工作主目录:", self.input_server_dir)
-        
-        self.input_gpu_id = LineEdit()
-        self.input_gpu_id.setText("0")
-        self.add_row(lyt_env, "GPU ID:", self.input_gpu_id)
-        
-        self.add_param_widget(grp_env)
-        self.add_param_stretch()
+UI_LAYOUT = {
+    "direction": "row",
+    "blocks": [
+        {"type": "form", "width": "420px", "height": "100%"},
+        {"type": "tabs", "flex": "1", "height": "100%", "panes": [
+            {"title": "💻 级联流水线脚本", "type": "code"},
+            {"title": "🎯 远端监控日志", "type": "terminal"},
+            {"title": "📤 批量云端产物", "type": "export"}
+        ]}
+    ],
+    "footer_actions": [
+        {"id": "compile_rfd", "label": "1. 编译 RF", "type": "default"},
+        {"id": "run_rfd", "label": "2. 跑 RF 并回收", "type": "primary"},
+        {"id": "compile_mpnn", "label": "3. 对齐编译 MPNN", "type": "default"},
+        {"id": "run_mpnn", "label": "4. 跑 MPNN", "type": "primary"},
+        {"id": "check_gpu", "label": "👀 查显卡", "type": "default"},
+        {"id": "abort", "label": "🛑 急停", "type": "danger"}
+    ]
+}
 
-        if self.is_setting_mode:
-            btn_save_config = PrimaryPushButton("💾 保存为全局默认参数", icon=FIF.SAVE)
-            btn_save_config.setFixedHeight(45)
-            btn_save_config.clicked.connect(self.save_settings_and_close)
-            self.param_layout.addWidget(btn_save_config)
-            return
+def get_sync_workspace():
+    config_file = os.path.abspath(os.path.join(os.path.dirname(__file__), "../sciforge_config.json"))
+    if os.path.exists(config_file):
+        try:
+            with open(config_file, "r", encoding="utf-8") as f:
+                cfg = json.load(f)
+                if cfg.get("data_hub_path"): return cfg.get("data_hub_path")
+        except: pass
+    return os.path.abspath(os.path.join(os.path.dirname(__file__), "../SciForge_Workspace/SciForge_Data"))
 
-        self.canvas_layout.setContentsMargins(0, 0, 0, 0)
-        
-        self.pivot = Pivot(self.canvas_panel)
-        self.stacked_widget = QStackedWidget(self.canvas_panel)
-        
-        vbox = QVBoxLayout()
-        vbox.addWidget(self.pivot)
-        vbox.addWidget(self.stacked_widget)
-        self.canvas_layout.addLayout(vbox)
-
-        font_code = QFont("Consolas", 11)
-        font_log = QFont("Consolas", 10)
-
-        self.align_display = TextEdit()
-        self.align_display.setFont(font_code)
-        self.align_display.setReadOnly(True)
-        self.align_display.setStyleSheet("background-color: #1e1e1e; color: #d4d4d4; border: none;")
-        self.addSubInterface(self.align_display, 'alignInterface', '📊 多链结构验证图')
-
-        self.rfd_display = PlainTextEdit()
-        self.rfd_display.setFont(font_code)
-        self.rfd_display.setStyleSheet("background-color: #1e1e1e; color: #ce9178; border: none;")
-        self.addSubInterface(self.rfd_display, 'rfdInterface', '📜 1_run_rfd.sh')
-
-        self.log_display = TextEdit()
-        self.log_display.setFont(font_log)
-        self.log_display.setReadOnly(True)
-        self.log_display.setStyleSheet("background-color: #1e1e1e; color: #d4d4d4; border: none;")
-        self.addSubInterface(self.log_display, 'logInterface', '🔍 顺序寻迹日志')
-
-        self.mpnn_display = PlainTextEdit()
-        self.mpnn_display.setFont(font_code)
-        self.mpnn_display.setStyleSheet("background-color: #1e1e1e; color: #c586c0; border: none;")
-        self.addSubInterface(self.mpnn_display, 'mpnnInterface', '📜 2_run_mpnn.sh')
-
-        self.json_display = PlainTextEdit()
-        self.json_display.setFont(font_log)
-        self.json_display.setStyleSheet("background-color: #f4f4f4; color: #333333; border: none;")
-        self.addSubInterface(self.json_display, 'jsonInterface', '📦 聚合 JSONL')
-
-        self.stacked_widget.currentChanged.connect(self.onCurrentIndexChanged)
-        self.pivot.setCurrentItem('alignInterface')
-
-    def addSubInterface(self, widget, objectName, text):
-        widget.setObjectName(objectName)
-        self.stacked_widget.addWidget(widget)
-        self.pivot.addItem(routeKey=objectName, text=text, onClick=lambda: self.stacked_widget.setCurrentWidget(widget))
-
-    def onCurrentIndexChanged(self, index):
-        widget = self.stacked_widget.widget(index)
-        self.pivot.setCurrentItem(widget.objectName())
-
-    def _load_config(self):
-        config = GlobalConfig.get_all_plugin_settings(self.plugin_id)
-        if config:
-            self.combo_mode.setCurrentText(config.get("mode", self.combo_mode.currentText()))
-            self.input_contig.setText(config.get("contig", self.input_contig.text()))
-            self.input_bias.setText(config.get("bias", self.input_bias.text()))
-            self.input_fixed.setText(config.get("fixed", self.input_fixed.text()))
-            self.input_hotspot.setText(config.get("hotspot", self.input_hotspot.text()))
-            self.input_partial_t.setText(config.get("partial_t", self.input_partial_t.text()))
-            self.input_ss_bias.setText(config.get("ss_bias", self.input_ss_bias.text()))
-            self.input_num_designs.setText(config.get("num_designs", self.input_num_designs.text()))
-            self.input_omit_aa.setText(config.get("omit_aa", self.input_omit_aa.text()))
-            self.input_seq_per_target.setText(config.get("seq_per_target", self.input_seq_per_target.text()))
-            self.chk_ss_enhance.setChecked(config.get("ss_enhance", self.chk_ss_enhance.isChecked()))
-            self.input_conda_sh.setText(config.get("conda_sh", self.input_conda_sh.text()))
-            self.input_rfd_env.setText(config.get("rfd_env", self.input_rfd_env.text()))
-            self.input_mpnn_env.setText(config.get("mpnn_env", self.input_mpnn_env.text()))
-            self.input_rfd_path.setText(config.get("rfd_path", self.input_rfd_path.text()))
-            self.input_mpnn_path.setText(config.get("mpnn_path", self.input_mpnn_path.text()))
-            self.input_server_dir.setText(config.get("server_dir", self.input_server_dir.text()))
-            self.input_gpu_id.setText(config.get("gpu_id", self.input_gpu_id.text()))
-            self.input_orig_pdb.setText(config.get("orig_pdb", ""))
-            self.input_rf_dir.setText(config.get("rf_dir", ""))
-
-    def _save_config(self):
-        config = {
-            "mode": self.combo_mode.currentText(),
-            "contig": self.input_contig.text(),
-            "bias": self.input_bias.text(),
-            "fixed": self.input_fixed.text(),
-            "hotspot": self.input_hotspot.text(),
-            "partial_t": self.input_partial_t.text(),
-            "ss_bias": self.input_ss_bias.text(),
-            "num_designs": self.input_num_designs.text(),
-            "omit_aa": self.input_omit_aa.text(),
-            "seq_per_target": self.input_seq_per_target.text(),
-            "ss_enhance": self.chk_ss_enhance.isChecked(),
-            "conda_sh": self.input_conda_sh.text(),
-            "rfd_env": self.input_rfd_env.text(),
-            "mpnn_env": self.input_mpnn_env.text(),
-            "rfd_path": self.input_rfd_path.text(),
-            "mpnn_path": self.input_mpnn_path.text(),
-            "server_dir": self.input_server_dir.text(),
-            "gpu_id": self.input_gpu_id.text(),
-            "orig_pdb": self.input_orig_pdb.text(),
-            "rf_dir": self.input_rf_dir.text()
-        }
-        GlobalConfig.set_all_plugin_settings(self.plugin_id, config)
-
-    def save_settings_and_close(self):
-        self._save_config()
-        parent_dlg = self.window()
-        if isinstance(parent_dlg, QDialog):
-            parent_dlg.accept()
-
-    def parse_pdb_atoms(self, filepath):
-        pdb_data = {}
-        with open(filepath, 'r', encoding='utf-8') as f:
-            for line in f:
-                try:
-                    if line.startswith("HELIX "):
-                        chain = line[19].strip()
+def parse_pdb_atoms(filepath):
+    pdb_data = {}
+    with open(filepath, 'r', encoding='utf-8') as f:
+        for line in f:
+            try:
+                if line.startswith("HELIX "):
+                    chain = line[19].strip()
+                    pdb_data.setdefault(chain, {'seq':{}, 'helices':[], 'sheets':[]})
+                    pdb_data[chain]['helices'].append((int(line[21:25].strip()), int(line[33:37].strip())))
+                elif line.startswith("SHEET "):
+                    chain = line[21].strip()
+                    pdb_data.setdefault(chain, {'seq':{}, 'helices':[], 'sheets':[]})
+                    pdb_data[chain]['sheets'].append((int(line[22:26].strip()), int(line[33:37].strip())))
+                elif (line.startswith("ATOM  ") or line.startswith("HETATM")) and line[13:16].strip() == "CA":
+                    chain = line[21].strip()
+                    res_name = line[17:20].strip()
+                    if res_name in AA_MAP:
                         pdb_data.setdefault(chain, {'seq':{}, 'helices':[], 'sheets':[]})
-                        pdb_data[chain]['helices'].append((int(line[21:25].strip()), int(line[33:37].strip())))
-                    elif line.startswith("SHEET "):
-                        chain = line[21].strip()
-                        pdb_data.setdefault(chain, {'seq':{}, 'helices':[], 'sheets':[]})
-                        pdb_data[chain]['sheets'].append((int(line[22:26].strip()), int(line[33:37].strip())))
-                    elif (line.startswith("ATOM  ") or line.startswith("HETATM")) and line[13:16].strip() == "CA":
-                        chain = line[21].strip()
-                        res_name = line[17:20].strip()
-                        if res_name in AA_MAP:
-                            pdb_data.setdefault(chain, {'seq':{}, 'helices':[], 'sheets':[]})
-                            res_num_raw = line[22:27].strip()
-                            res_num_str = "".join([c for c in res_num_raw if c.isdigit() or c == '-'])
-                            if res_num_str:
-                                pdb_data[chain]['seq'][int(res_num_str)] = AA_MAP[res_name]
-                except Exception:
-                    pass 
-        return pdb_data
+                        res_num_raw = line[22:27].strip()
+                        res_num_str = "".join([c for c in res_num_raw if c.isdigit() or c == '-'])
+                        if res_num_str:
+                            pdb_data[chain]['seq'][int(res_num_str)] = AA_MAP[res_name]
+            except Exception: pass 
+    return pdb_data
 
-    def load_orig_pdb(self):
-        filepath, _ = QFileDialog.getOpenFileName(self, "选择原始 PDB", "", "PDB Files (*.pdb)")
-        if filepath:
-            self.input_orig_pdb.setText(filepath)
-            self.orig_pdb_path = filepath
-            self.pdb_data_dict.clear()
-            pdb_name = os.path.splitext(os.path.basename(filepath))[0]
-            self.pdb_data_dict[pdb_name] = self.parse_pdb_atoms(filepath)
-            QMessageBox.information(self, "成功", "原始 PDB 载入成功！(已滤除潜在插入码)")
-            self._save_config()
+def generate_alignment_comments(pdb_data_dict, fixed_data_map, bias_data_map):
+    """生成极其直观的序列、二级结构、与动态约束比对视图"""
+    align_comments = []
+    align_comments.append("# ============================================================================")
+    align_comments.append("# 📊 编译后序列对齐与约束落位视图 (Visual Alignment)")
+    align_comments.append("# ============================================================================")
+    align_comments.append("# 说明: IDX代表连续编号. H(螺旋) E(折叠) C(卷曲). 约束: F(锁定) B(偏好) -(自由)")
+    align_comments.append("#")
+    
+    for pdb_name, data in pdb_data_dict.items():
+        local_fixed = fixed_data_map.get(pdb_name, {})
+        local_bias = bias_data_map.get(pdb_name, {})
+        has_bias = len(local_bias) > 0
 
-    def select_rf_dir(self):
-        dirpath = QFileDialog.getExistingDirectory(self, "选择 RF 输出目录")
-        if dirpath: 
-            self.input_rf_dir.setText(dirpath)
-            self._save_config()
-
-    def log(self, text, level="info"):
-        color_map = {
-            "info": "#569cd6",
-            "success": "#4ec9b0",
-            "warn": "#f44336"
-        }
-        color = color_map.get(level, "#d4d4d4")
-        bold = 'font-weight: bold;' if level in ['success', 'warn'] else ''
-        html_text = f'<span style="color: {color}; {bold}">{html.escape(text)}</span><br>'
-        
-        cursor = self.log_display.textCursor()
-        cursor.movePosition(cursor.End)
-        self.log_display.setTextCursor(cursor)
-        self.log_display.insertHtml(html_text)
-        self.log_display.ensureCursorVisible()
-
-    def _ensure_pdb_loaded(self):
-        if not self.pdb_data_dict:
-            path = self.input_orig_pdb.text().strip()
-            if path and os.path.exists(path):
-                self.orig_pdb_path = path
-                pdb_name = os.path.splitext(os.path.basename(path))[0]
-                self.pdb_data_dict[pdb_name] = self.parse_pdb_atoms(path)
-                return True
-            return False
-        return True
-
-    def compile_rfd_step(self):
-        self._save_config()
-        if not self._ensure_pdb_loaded():
-            QMessageBox.warning(self, "警告", "请先正确填写或导入【本地原始 PDB】！")
-            return
-
-        global_bias, global_fixed = {}, {}
-        
-        if self.input_bias.text().strip():
-            for p in [x.strip() for x in self.input_bias.text().split(',')]:
-                if ':' in p:
-                    loc, aa = p.split(':')
-                    try: global_bias.setdefault(loc[0], {})[int(loc[1:])] = aa.upper()
-                    except ValueError: pass
-
-        if self.input_fixed.text().strip():
-            for item in self.input_fixed.text().split(','):
-                item = item.strip()
-                if not item: continue
-                chain = item[0]
-                if chain not in global_fixed: global_fixed[chain] = []
-                if len(item) == 1: global_fixed[chain].extend(list(range(-1000, 10000)))
-                elif '-' in item[1:]:
-                    s, e = map(int, item[1:].split('-'))
-                    global_fixed[chain].extend(list(range(s, e+1)))
-                else: global_fixed[chain].append(int(item[1:]))
-
-        has_bias = len(global_bias) > 0
-
-        html_lines = []
-        html_lines.append('<pre style="font-family: Consolas, monospace; font-size: 13px;">')
-        html_lines.append('<b><span style="color: #569cd6;">&gt;&gt;&gt; 多链突变设计与二级结构校验图 &lt;&lt;&lt;</span></b><br><br>')
-        html_lines.append('<b><span style="color: #f44336;">[说明] 这里的 IDX 仅代表原 WT 样本中的连续顺序，不代表生成后的变长编号。</span></b><br>')
-        html_lines.append('       二级结构: H (螺旋) E (折叠) C (卷曲)<br>')
-        html_lines.append('       约束: F (锁定区) | ')
-        if has_bias: html_lines.append('B (偏好突变) | ')
-        html_lines.append('- (自由扩散)<br><br>')
-
-        pdb_name = list(self.pdb_data_dict.keys())[0]
-        data = self.pdb_data_dict[pdb_name]
-        
+        align_comments.append(f"# >>> 实体模型: {pdb_name} <<<")
         for chain, cdata in data.items():
-            html_lines.append(f'<b><span style="color: #569cd6;">========== Chain {chain} ==========</span></b><br>')
             seq_dict = cdata['seq']
             if not seq_dict: continue
-            
+            align_comments.append(f"# ---------- Chain {chain} ----------")
             sorted_res = sorted(list(seq_dict.keys()))
             seq_str = "".join([seq_dict[r] for r in sorted_res])
-            fix_str = "".join(["F" if (chain in global_fixed and r in global_fixed[chain]) else "-" for r in sorted_res])
-            bia_str = "".join([global_bias[chain][r] if (chain in global_bias and r in global_bias[chain]) else "-" for r in sorted_res])
-            
-            ss_str = ""
-            idx_str = ""
+            fix_str = "".join(["F" if (chain in local_fixed and r in local_fixed[chain]) else "-" for r in sorted_res])
+
+            bia_str = ""
+            for r in sorted_res:
+                b_val = local_bias.get(chain, {}).get(r) or local_bias.get(chain, {}).get(str(r))
+                if isinstance(b_val, dict): bia_str += list(b_val.keys())[0]
+                elif isinstance(b_val, str): bia_str += b_val
+                else: bia_str += "-"
+
+            ss_str, idx_str = "", ""
             for i, r in enumerate(sorted_res):
                 is_h = any(start <= r <= end for start, end in cdata.get('helices', []))
                 is_e = any(start <= r <= end for start, end in cdata.get('sheets', []))
                 if is_h: ss_str += "H"
                 elif is_e: ss_str += "E"
                 else: ss_str += "C"
-                
+
                 mapping_idx = i + 1
                 if mapping_idx % 10 == 0: idx_str += str(mapping_idx // 10)[-1]
                 elif mapping_idx % 5 == 0: idx_str += "+"
                 else: idx_str += "."
-            
+
             for i in range(0, len(seq_str), 60):
                 chunk_ss = ss_str[i:i+60]
                 chunk_seq = seq_str[i:i+60]
                 chunk_fix = fix_str[i:i+60]
                 chunk_bia = bia_str[i:i+60]
                 chunk_idx = idx_str[i:i+60]
-                res_start = sorted_res[i] 
-                renum_start = i + 1 
-                
-                html_lines.append(f'<span style="color: #569cd6;">IDX [{renum_start:4d}] : {chunk_idx}</span><br>')
-                
-                html_lines.append(f'SS  [{res_start:4d}] : ')
-                for char in chunk_ss:
-                    if char == 'H': html_lines.append(f'<b><span style="color: #4ec9b0;">{char}</span></b>')
-                    elif char == 'E': html_lines.append(f'<b><span style="color: #c586c0;">{char}</span></b>')
-                    else: html_lines.append(f'<span style="color: #808080;">{char}</span>')
-                html_lines.append('<br>')
-                
-                html_lines.append(f'SEQ [{res_start:4d}] : {chunk_seq}<br>')
-                
-                html_lines.append('FIX        : ')
-                for char in chunk_fix:
-                    if char == 'F': html_lines.append(f'<b><span style="color: #ffffff; background-color: #4ec9b0;">{char}</span></b>')
-                    else: html_lines.append(char)
-                html_lines.append('<br>')
-                
-                if has_bias:
-                    html_lines.append('BIA        : ')
-                    for char in chunk_bia:
-                        if char != '-': html_lines.append(f'<b><span style="color: #ffffff; background-color: #f44336;">{char}</span></b>')
-                        else: html_lines.append(char)
-                    html_lines.append('<br>')
-                html_lines.append('<br>')
+                res_start = sorted_res[i]
+                renum_start = i + 1
 
-        html_lines.append('</pre>')
-        self.align_display.setHtml("".join(html_lines))
+                align_comments.append(f"# IDX [{renum_start:4d}] : {chunk_idx}")
+                align_comments.append(f"# SS  [{res_start:4d}] : {chunk_ss}")
+                align_comments.append(f"# SEQ [{res_start:4d}] : {chunk_seq}")
+                align_comments.append(f"# FIX        : {chunk_fix}")
+                if has_bias: align_comments.append(f"# BIA        : {chunk_bia}")
+                align_comments.append("#")
+    align_comments.append("# ============================================================================\n")
+    return "\n".join(align_comments)
 
-        mode = self.combo_mode.currentText()
-        server_dir = self.input_server_dir.text().strip()
-        if server_dir and not server_dir.endswith('/'): server_dir += '/'
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--action', type=str, default='compile_rfd')
+    for item in UI_SCHEMA:
+        if item["type"] == "boolean": parser.add_argument(f"--{item['key']}", action="store_true")
+        elif item["type"] == "number": parser.add_argument(f"--{item['key']}", type=float, default=item.get("default", 0.0))
+        else: parser.add_argument(f"--{item['key']}", type=str, default=str(item.get("default", "")))
+            
+    args = parser.parse_args()
+    
+    workspace = get_sync_workspace()
+    temp_dir = os.path.join(workspace, ".cache")
+    os.makedirs(temp_dir, exist_ok=True)
+    manifest_rfd = os.path.join(temp_dir, "matcher_rfd_manifest.json")
+    manifest_mpnn = os.path.join(temp_dir, "matcher_mpnn_manifest.json")
+    
+    server_dir = args.server_dir.strip()
+    if server_dir and not server_dir.endswith('/'): server_dir += '/'
+    task_dir = f"{server_dir}task_dynamic_matcher/"
+
+    # =========================================================================
+    # Phase 1: 编译 RFdiffusion (Action: compile_rfd)
+    # =========================================================================
+    if args.action == 'compile_rfd':
+        print(">>> 启动第一阶段：编译 RF 拓扑扩散脚本...")
         
+        if not getattr(args, 'two_stage', False):
+            print("❌ [拦截] 变长设计与匹配引擎【必须】使用两段式交互流水线。")
+            print("💡 原因: 需要先让云端跑出 RF 变长骨架并拉回本地，才能由本机 Python 执行精确的子序列拓扑追踪与对齐。")
+            print("👉 请勾选参数顶部的 [🔀 开启两段式交互] 选项后再试！"); sys.exit(1)
+
+        orig_pdb_str = str(getattr(args, 'orig_pdb', '')).strip()
+        if not orig_pdb_str:
+            print("❌ [Fatal] 请上传【原始骨架/靶点 (WT) PDB】！"); sys.exit(1)
+            
+        orig_pdb_path = os.path.join(workspace, orig_pdb_str.split(',')[0].strip())
+        if not os.path.exists(orig_pdb_path):
+            print(f"❌ [Fatal] 找不到原始 PDB: {orig_pdb_path}"); sys.exit(1)
+
+        # 构建对原始 WT PDB 的序列约束预览视图
+        orig_name = os.path.splitext(os.path.basename(orig_pdb_path))[0]
+        orig_data_dict = { orig_name: parse_pdb_atoms(orig_pdb_path) }
+        global_fixed, global_bias = {}, {}
+        
+        if args.fixed.strip():
+            for item in args.fixed.split(','):
+                item = item.strip()
+                if not item: continue
+                chain = item[0]
+                if len(item) == 1: global_fixed.setdefault(chain, []).extend(list(range(-1000, 10000)))
+                elif '-' in item[1:]:
+                    s, e = map(int, item[1:].split('-'))
+                    global_fixed.setdefault(chain, []).extend(list(range(s, e+1)))
+                else: global_fixed.setdefault(chain, []).append(int(item[1:]))
+
+        if args.bias.strip():
+            for p in [x.strip() for x in args.bias.split(',')]:
+                if ':' in p:
+                    loc, aa = p.split(':')
+                    try: global_bias.setdefault(loc[0], {})[int(loc[1:])] = aa.upper()
+                    except ValueError: pass
+
+        align_str = generate_alignment_comments(orig_data_dict, {orig_name: global_fixed}, {orig_name: global_bias})
+
         rfd_extras = ""
-        if "Binder" in mode and self.input_hotspot.text(): rfd_extras += f" \\\n            ppi.hotspot_res=[{self.input_hotspot.text()}]"
-        if "Partial" in mode: rfd_extras += f" \\\n            diffuser.partial_T={self.input_partial_t.text()}"
+        if "Binder" in args.mode and args.hotspot: rfd_extras += f" \\\n            ppi.hotspot_res=[{args.hotspot}]"
+        if "Partial" in args.mode: rfd_extras += f" \\\n            diffuser.partial_T={args.partial_t}"
+        if args.ss_bias.strip(): rfd_extras += f" \\\n            scaffoldguided.scaffoldguided=True scaffoldguided.target_ss=\"{args.ss_bias.strip()}\""
         
-        ss_input = self.input_ss_bias.text().strip()
-        if ss_input:
-            rfd_extras += f" \\\n            scaffoldguided.scaffoldguided=True scaffoldguided.target_ss=\"{ss_input}\""
-
-        rfd_bash = f"""#!/bin/bash
-# ==========================================
-# 步骤 1: 运行 RFdiffusion
-# ==========================================
+        bash_script = f"""#!/bin/bash\n{align_str}
+# ============================================================================
+# 动态匹配引擎 Phase 1: RFdiffusion
+# ============================================================================
 set -e
-export CUDA_VISIBLE_DEVICES="{self.input_gpu_id.text().strip()}"
-source {self.input_conda_sh.text().strip()}
-conda activate {self.input_rfd_env.text().strip()}
+export CUDA_VISIBLE_DEVICES="{args.gpu_id.strip()}"
+RFD_SCRIPT="{args.rfd_path.strip()}"
 
-INPUT_DIR="{server_dir}input_pdbs"
-OUT_DIR="{server_dir}rfd_out"
-mkdir -p $OUT_DIR
+INPUT_DIR="{task_dir}wt_input"
+OUT_DIR="{task_dir}design_output/rfd_out"
+LOG_DIR="{task_dir}logs"
+LOG_FILE="$LOG_DIR/master_pipeline.log"
 
-echo ">> 开始批量扩散..."
+mkdir -p $INPUT_DIR $OUT_DIR $LOG_DIR
+echo $$ > "{task_dir}main_pipeline.pid"
+
+{{
+echo "=========================================================="
+echo "🚀 [Start] RFdiffusion 生成开始时间: $(date)"
+echo "=========================================================="
+source {args.conda_sh.strip()}
+conda activate {args.rfd_env.strip()}
+
 for INPUT_PDB in $INPUT_DIR/*.pdb; do
     if [ -f "$INPUT_PDB" ]; then
         BASENAME=$(basename "$INPUT_PDB" .pdb)
-        python {self.input_rfd_path.text().strip()} \\
+        echo ">> [RF] 正在扩散: $BASENAME"
+        python $RFD_SCRIPT \\
             inference.input_pdb="$INPUT_PDB" \\
             inference.output_prefix=$OUT_DIR/${{BASENAME}} \\
-            contigmap.contigs="{self.input_contig.text()}" \\
-            inference.num_designs={self.input_num_designs.text()}{rfd_extras} \\
-            >> {server_dir}rfdiffusion.log 2>&1
+            contigmap.contigs="{args.contig}" \\
+            inference.num_designs={int(args.num_designs)}{rfd_extras} &
+        
+        STEP_PID=$!
+        echo $STEP_PID > "{task_dir}current_step.pid"
+        wait $STEP_PID
     fi
 done
-echo "RFdiffusion 完成！请将生成的 PDB 下载至本地运行【第 2 步：动态匹配】。"
+
+echo "=========================================================="
+echo "🏁 [End] RFdiffusion 结束时间: $(date)"
+echo "=========================================================="
+echo "✅ RF 生成完成！打包 rfd_out 回传前端..."
+cd {task_dir}
+tar -czf rfd_bundle.tar.gz design_output/rfd_out/ logs/
+}} 2>&1 | tee $LOG_FILE
+
+echo "===BUNDLE_READY==="
 """
-        self.rfd_display.setPlainText(rfd_bash)
-        self.stacked_widget.setCurrentWidget(self.rfd_display)
-        self.pivot.setCurrentItem('rfdInterface')
-        QMessageBox.information(self, "成功", "多链验证图已渲染完毕，RF 脚本就绪！")
-
-
-    def compile_mpnn_step(self):
-        self._save_config()
-        if not self._ensure_pdb_loaded():
-            QMessageBox.warning(self, "提示", "请确保已输入【原始 PDB】！")
-            return
-            
-        orig_pdb = self.input_orig_pdb.text().strip()
-        rf_dir = self.input_rf_dir.text().strip()
+        sh_path = os.path.join(temp_dir, "1_run_rfd.sh")
+        with open(sh_path, 'w', encoding='utf-8', newline='\n') as f: 
+            f.write(bash_script.replace('\r\n', '\n').replace('\r', ''))
         
-        if not orig_pdb or not rf_dir:
-            QMessageBox.warning(self, "提示", "匹配前请选择【下载的 rfd_out 目录】！")
-            return
+        with open(manifest_rfd, 'w', encoding='utf-8') as f:
+            json.dump({"orig_pdb": orig_pdb_path, "sh": sh_path, "task_dir": task_dir}, f)
 
-        self.log_display.clear()
-        self.log(">>> 启动 [固定区块顺序寻迹] 防弹追踪引擎...", "info")
+        print(f"[OutputCode] .cache/1_run_rfd.sh")
+        print("\n" + "="*50)
+        print(" 🛠️ RF 编译完成！请在上方代码区检查原始序列比对后，点击 [2. 跑 RF 并回收]。")
+        print("="*50)
+
+
+    # =========================================================================
+    # Phase 2: 跑 RF 并回收 (Action: run_rfd)
+    # =========================================================================
+    elif args.action == 'run_rfd':
+        if not HAS_SSH: print("❌ [Fatal] 缺少 paramiko"); sys.exit(1)
+        if not os.path.exists(manifest_rfd): print("❌ [Fatal] 未找到 rfd_manifest！"); sys.exit(1)
+            
+        with open(manifest_rfd, 'r', encoding='utf-8') as f: manifest = json.load(f)
         
         try:
-            orig_data = self.parse_pdb_atoms(orig_pdb)
-            global_fixed, global_bias, global_omit = {}, {}, {}
+            ssh = paramiko.SSHClient()
+            ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+            ssh.connect(args.ssh_host, port=int(args.ssh_port), username=args.ssh_user, password=args.ssh_pwd, timeout=10)
             
-            if self.input_fixed.text().strip():
-                for item in self.input_fixed.text().split(','):
-                    item = item.strip()
-                    if not item: continue
-                    chain = item[0]
-                    if len(item) == 1: global_fixed.setdefault(chain, []).extend(list(range(-1000, 10000)))
-                    elif '-' in item[1:]:
-                        s, e = map(int, item[1:].split('-'))
-                        global_fixed.setdefault(chain, []).extend(list(range(s, e+1)))
-                    else: global_fixed.setdefault(chain, []).append(int(item[1:]))
+            sftp = ssh.open_sftp()
+            print(f"📂 [SSH] 初始化云端沙盒目录: {task_dir}wt_input")
+            _, stdout, _ = ssh.exec_command(f"mkdir -p {task_dir}wt_input")
+            stdout.channel.recv_exit_status()
 
-            if self.input_bias.text().strip():
-                for p in [x.strip() for x in self.input_bias.text().split(',')]:
-                    if ':' in p:
-                        loc, aa = p.split(':')
-                        try: global_bias.setdefault(loc[0], {})[int(loc[1:])] = aa.upper()
-                        except ValueError: pass
-
-            if self.chk_ss_enhance.isChecked():
-                for chain, data in orig_data.items():
-                    ss_res_list = set()
-                    for start, end in data['helices'] + data['sheets']:
-                        ss_res_list.update(list(range(start, end + 1)))
-                    valid_ss = [r for r in ss_res_list if r in data['seq']]
-                    if valid_ss: global_omit[chain] = valid_ss
+            print(f"⬆️ [SFTP] 投递 WT PDB 和 RF 脚本至云端...")
+            sftp.put(manifest['sh'], f"{task_dir}1_run_rfd.sh")
+            _, stdout, _ = ssh.exec_command(f"chmod +x {task_dir}1_run_rfd.sh")
+            stdout.channel.recv_exit_status()
             
-            has_fixed, has_bias, has_omit = len(global_fixed)>0, len(global_bias)>0, len(global_omit)>0
-            rf_pdbs = glob.glob(os.path.join(rf_dir, "*.pdb"))
-            self.log(f"找到 {len(rf_pdbs)} 个新骨架，执行安全处理...", "info")
+            sftp.put(manifest['orig_pdb'], f"{task_dir}wt_input/{os.path.basename(manifest['orig_pdb'])}")
             
-            self.generated_fixed_data, self.generated_bias_data, self.generated_omit_data = {}, {}, {}
-            success_count = 0
-            fail_count = 0
+            print(f"🔥 [SSH] 开始下发执行命令，前方发来高能日志流...\n")
+            print("—" * 50)
+            ssh.exec_command(f"sed -i 's/\\r$//' {task_dir}1_run_rfd.sh")
+            stdin, stdout, stderr = ssh.exec_command(f"bash -lc 'bash {task_dir}1_run_rfd.sh'", get_pty=True)
+            
+            for line in iter(stdout.readline, ""):
+                if not line: break
+                clean_line = line.strip()
+                if clean_line == "===BUNDLE_READY===": break
+                if clean_line: print(f"[Cluster] {clean_line}", flush=True)
 
-            for rf_path in rf_pdbs:
-                rf_name = os.path.splitext(os.path.basename(rf_path))[0]
+            print("—" * 50)
+            print(f"\n⬇️ [SFTP] RF 运算结束！正在将骨架打包下载至前端...")
+            
+            remote_tar = f"{task_dir}rfd_bundle.tar.gz"
+            local_tar = os.path.join(temp_dir, "rfd_bundle.tar.gz")
+            sftp.get(remote_tar, local_tar)
+            sftp.close(); ssh.close()
+
+            try:
+                with tarfile.open(local_tar, "r:gz") as tar: tar.extractall(path=temp_dir)
+                for target_dir in ["design_output", "logs"]:
+                    extract_dir = os.path.join(temp_dir, target_dir)
+                    if os.path.exists(extract_dir):
+                        for root, _, files in os.walk(extract_dir):
+                            for file in files:
+                                ext = os.path.splitext(file)[1].lower()
+                                if ext in ['.pdb', '.log']:
+                                    rel_path = os.path.relpath(os.path.join(root, file), workspace)
+                                    print(f"[OutputFile] {rel_path.replace(os.sep, '/')}")
+            except Exception as tar_err: print(f"❌ 本地解压失败: {tar_err}")
+
+            print(f"\n🎉 [Success] RF 骨架已回收！")
+            print("👉 请在左侧【📤 批量产物导出】保存满意的骨架，并将其拖入第二阶段的参数框中！")
+
+        except Exception as e: print(f"❌ [SSH Error] 执行崩溃: {e}"); sys.exit(1)
+
+
+    # =========================================================================
+    # Phase 3: 动态匹配并编译 MPNN (Action: compile_mpnn)
+    # =========================================================================
+    elif args.action == 'compile_mpnn':
+        print(">>> 启动第二阶段：动态序列对齐与 MPNN 编译...")
+        orig_pdb_str = str(getattr(args, 'orig_pdb', '')).strip()
+        rfd_pdbs_str = str(getattr(args, 'rfd_pdbs', '')).strip()
+        
+        if not orig_pdb_str or not rfd_pdbs_str:
+            print("❌ [Fatal] 请确保已正确填写【原始WT PDB】与【挑选的 RF 骨架】！"); sys.exit(1)
+            
+        orig_pdb_path = os.path.join(workspace, orig_pdb_str.split(',')[0].strip())
+        rfd_pdb_paths = [os.path.join(workspace, p.strip()) for p in rfd_pdbs_str.split(',') if p.strip()]
+
+        print(">>> 启动 [固定区块顺序寻迹] 防弹追踪引擎...")
+        
+        orig_data = parse_pdb_atoms(orig_pdb_path)
+        global_fixed, global_bias, global_omit = {}, {}, {}
+        
+        if args.fixed.strip():
+            for item in args.fixed.split(','):
+                item = item.strip()
+                if not item: continue
+                chain = item[0]
+                if len(item) == 1: global_fixed.setdefault(chain, []).extend(list(range(-1000, 10000)))
+                elif '-' in item[1:]:
+                    s, e = map(int, item[1:].split('-'))
+                    global_fixed.setdefault(chain, []).extend(list(range(s, e+1)))
+                else: global_fixed.setdefault(chain, []).append(int(item[1:]))
+
+        if args.bias.strip():
+            for p in [x.strip() for x in args.bias.split(',')]:
+                if ':' in p:
+                    loc, aa = p.split(':')
+                    try: global_bias.setdefault(loc[0], {})[int(loc[1:])] = aa.upper()
+                    except ValueError: pass
+
+        if args.ss_enhance:
+            for chain, data in orig_data.items():
+                ss_res_list = set()
+                for start, end in data['helices'] + data['sheets']:
+                    ss_res_list.update(list(range(start, end + 1)))
+                valid_ss = [r for r in ss_res_list if r in data['seq']]
+                if valid_ss: global_omit[chain] = valid_ss
+        
+        has_fixed, has_bias, has_omit = len(global_fixed)>0, len(global_bias)>0, len(global_omit)>0
+        print(f"找到 {len(rfd_pdb_paths)} 个需对齐的新骨架，执行安全处理...")
+        
+        rfd_parsed_dict = {}
+        generated_fixed_data, generated_bias_data, generated_omit_data = {}, {}, {}
+        success_count, fail_count = 0, 0
+
+        for rf_path in rfd_pdb_paths:
+            if not os.path.exists(rf_path): continue
+            rf_name = os.path.splitext(os.path.basename(rf_path))[0]
+            
+            try:
+                rf_data = parse_pdb_atoms(rf_path)
+                rfd_parsed_dict[rf_name] = rf_data
+                rf_fixed, rf_bias, rf_omit = {}, {}, {}
+                orig_to_rf_map = {}
                 
-                try:
-                    rf_data = self.parse_pdb_atoms(rf_path)
-                    rf_fixed, rf_bias, rf_omit = {}, {}, {}
-                    orig_to_rf_map = {}
+                for orig_chain in global_fixed:
+                    if orig_chain not in orig_data: continue
+                    orig_to_rf_map.setdefault(orig_chain, {})
                     
-                    for orig_chain in global_fixed:
-                        if orig_chain not in orig_data: continue
-                        orig_to_rf_map.setdefault(orig_chain, {})
+                    req_nums = sorted(list(set(global_fixed[orig_chain])))
+                    if not req_nums: continue
+                    
+                    blocks = []
+                    current_block = [req_nums[0]]
+                    for i in range(1, len(req_nums)):
+                        if req_nums[i] == req_nums[i-1] + 1:
+                            current_block.append(req_nums[i])
+                        else:
+                            blocks.append(current_block)
+                            current_block = [req_nums[i]]
+                    blocks.append(current_block)
+
+                    for rf_chain, rf_cdata in rf_data.items():
+                        rf_nums = sorted(list(rf_cdata['seq'].keys()))
+                        rf_seq = "".join([rf_cdata['seq'][r] for r in rf_nums])
                         
-                        req_nums = sorted(list(set(global_fixed[orig_chain])))
-                        if not req_nums: continue
+                        search_start_idx = 0
+                        temp_map = {}
+                        matched_all_blocks = True
                         
-                        blocks = []
-                        current_block = [req_nums[0]]
-                        for i in range(1, len(req_nums)):
-                            if req_nums[i] == req_nums[i-1] + 1:
-                                current_block.append(req_nums[i])
+                        for block in blocks:
+                            valid_block = [r for r in block if r in orig_data[orig_chain]['seq']]
+                            if not valid_block: continue
+                            probe_seq = "".join([orig_data[orig_chain]['seq'][r] for r in valid_block])
+                            
+                            found_idx = rf_seq.find(probe_seq, search_start_idx)
+                            
+                            if found_idx != -1:
+                                for i, orig_res_num in enumerate(valid_block):
+                                    rf_mapped_idx = found_idx + i + 1  
+                                    temp_map[orig_res_num] = (rf_chain, int(rf_mapped_idx))
+                                search_start_idx = found_idx + len(probe_seq)
                             else:
-                                blocks.append(current_block)
-                                current_block = [req_nums[i]]
-                        blocks.append(current_block)
-
-                        for rf_chain, rf_cdata in rf_data.items():
-                            rf_nums = sorted(list(rf_cdata['seq'].keys()))
-                            rf_seq = "".join([rf_cdata['seq'][r] for r in rf_nums])
-                            
-                            search_start_idx = 0
-                            temp_map = {}
-                            matched_all_blocks = True
-                            
-                            for block in blocks:
-                                valid_block = [r for r in block if r in orig_data[orig_chain]['seq']]
-                                if not valid_block: continue
-                                probe_seq = "".join([orig_data[orig_chain]['seq'][r] for r in valid_block])
-                                
-                                found_idx = rf_seq.find(probe_seq, search_start_idx)
-                                
-                                if found_idx != -1:
-                                    for i, orig_res_num in enumerate(valid_block):
-                                        rf_mapped_idx = found_idx + i + 1  
-                                        temp_map[orig_res_num] = (rf_chain, str(rf_mapped_idx))
-                                    search_start_idx = found_idx + len(probe_seq)
-                                else:
-                                    matched_all_blocks = False
-                                    break 
-                                    
-                            if matched_all_blocks and temp_map:
-                                orig_to_rf_map[orig_chain].update(temp_map)
+                                matched_all_blocks = False
                                 break 
+                                
+                        if matched_all_blocks and temp_map:
+                            orig_to_rf_map[orig_chain].update(temp_map)
+                            break 
 
-                    def get_mapped(orig_chain, req_num):
-                        if orig_chain in orig_to_rf_map and req_num in orig_to_rf_map[orig_chain]:
-                            return orig_to_rf_map[orig_chain][req_num]
-                        return None, None
+                def get_mapped(orig_chain, req_num):
+                    if orig_chain in orig_to_rf_map and req_num in orig_to_rf_map[orig_chain]:
+                        return orig_to_rf_map[orig_chain][req_num]
+                    return None, None
 
-                    for orig_chain in global_fixed:
-                        if orig_chain not in orig_data: continue
-                        for req_num in global_fixed[orig_chain]:
-                            rf_chain, mapped_idx = get_mapped(orig_chain, req_num)
-                            if rf_chain: rf_fixed.setdefault(rf_chain, []).append(int(mapped_idx))
+                for orig_chain in global_fixed:
+                    if orig_chain not in orig_data: continue
+                    for req_num in global_fixed[orig_chain]:
+                        rf_chain, mapped_idx = get_mapped(orig_chain, req_num)
+                        if rf_chain: rf_fixed.setdefault(rf_chain, []).append(mapped_idx)
 
-                    for orig_chain in global_bias:
-                        if orig_chain not in orig_data: continue
-                        for req_num, mut_aa in global_bias[orig_chain].items():
-                            rf_chain, mapped_idx = get_mapped(orig_chain, req_num)
-                            if rf_chain: rf_bias.setdefault(rf_chain, {})[mapped_idx] = {mut_aa: 10000.0}
+                for orig_chain in global_bias:
+                    if orig_chain not in orig_data: continue
+                    for req_num, mut_aa in global_bias[orig_chain].items():
+                        rf_chain, mapped_idx = get_mapped(orig_chain, req_num)
+                        if rf_chain: rf_bias.setdefault(rf_chain, {})[str(mapped_idx)] = {mut_aa: 10000.0}
 
-                    for orig_chain in global_omit:
-                        if orig_chain not in orig_data: continue
-                        for req_num in global_omit[orig_chain]:
-                            rf_chain, mapped_idx = get_mapped(orig_chain, req_num)
-                            if rf_chain: rf_omit.setdefault(rf_chain, {})[mapped_idx] = "PG"
+                for orig_chain in global_omit:
+                    if orig_chain not in orig_data: continue
+                    for req_num in global_omit[orig_chain]:
+                        rf_chain, mapped_idx = get_mapped(orig_chain, req_num)
+                        if rf_chain: rf_omit.setdefault(rf_chain, {})[str(mapped_idx)] = "PG"
 
-                    for c in rf_fixed: rf_fixed[c] = list(set(rf_fixed[c]))
-                    
-                    if has_fixed: self.generated_fixed_data[rf_name] = rf_fixed
-                    if has_bias: self.generated_bias_data[rf_name] = rf_bias
-                    if has_omit: self.generated_omit_data[rf_name] = rf_omit
-                    success_count += 1
-                    
-                except Exception as inner_e:
-                    self.log(f"⚠️ 跳过受损文件 {rf_name}.pdb: {str(inner_e)}", "warn")
-                    fail_count += 1
+                for c in rf_fixed: rf_fixed[c] = list(set(rf_fixed[c]))
                 
-                finally:
-                    if has_fixed and rf_name not in self.generated_fixed_data:
-                        self.generated_fixed_data[rf_name] = {chain: [] for chain in orig_data.keys()}
-                    if has_bias and rf_name not in self.generated_bias_data:
-                        self.generated_bias_data[rf_name] = {chain: {} for chain in orig_data.keys()}
-                    if has_omit and rf_name not in self.generated_omit_data:
-                        self.generated_omit_data[rf_name] = {chain: {} for chain in orig_data.keys()}
+                if has_fixed: generated_fixed_data[rf_name] = rf_fixed
+                if has_bias: generated_bias_data[rf_name] = rf_bias
+                if has_omit: generated_omit_data[rf_name] = rf_omit
+                success_count += 1
                 
-            self.log(f"\n✅ 处理圆满结束！成功解算 {success_count} 个，拦截废片 {fail_count} 个。\n(已为所有废片填入空壳约束，确保 MPNN 不会崩溃)", "success")
-
-            json_text = ""
-            if self.generated_fixed_data:
-                json_text += "=== 聚合 Fixed JSONL 预览 (展示首个样本) ===\n"
-                sample_item = list(self.generated_fixed_data.items())[0]
-                json_text += json.dumps({sample_item[0]: sample_item[1]}, indent=2) + "\n\n"
-            if self.generated_bias_data:
-                json_text += "=== 聚合 Bias JSONL 预览 (展示首个样本) ===\n"
-                sample_item = list(self.generated_bias_data.items())[0]
-                json_text += json.dumps({sample_item[0]: sample_item[1]}, indent=2) + "\n\n"
-            if self.generated_omit_data:
-                json_text += "=== 二级结构保护 Omit (禁用 P/G) 预览 (展示首个样本) ===\n"
-                sample_item = list(self.generated_omit_data.items())[0]
-                json_text += json.dumps({sample_item[0]: sample_item[1]}, indent=2) + "\n\n"
-            self.json_display.setPlainText(json_text)
-
-            server_dir = self.input_server_dir.text().strip()
-            if server_dir and not server_dir.endswith('/'): server_dir += '/'
+            except Exception as inner_e:
+                print(f"⚠️ 跳过受损文件 {rf_name}.pdb: {str(inner_e)}")
+                fail_count += 1
             
-            mpnn_flags = ""
-            if has_fixed: mpnn_flags += f" \\\n    --fixed_positions_jsonl {server_dir}dynamic_fixed.jsonl"
-            if has_bias: mpnn_flags += f" \\\n    --bias_AA_jsonl {server_dir}dynamic_bias.jsonl"
-            if has_omit: mpnn_flags += f" \\\n    --omit_AA_jsonl {server_dir}dynamic_omit.jsonl"
+        print(f"\n✅ 对齐解算圆满结束！成功解算 {success_count} 个，废弃 {fail_count} 个。")
 
-            mpnn_bash = f"""#!/bin/bash
-# ==========================================
-# 步骤 2: 运行 ProteinMPNN 
-# ==========================================
+        local_jsonls = []
+        if has_fixed:
+            jp = os.path.join(temp_dir, "dynamic_fixed.jsonl")
+            with open(jp, 'w', encoding='utf-8') as f:
+                for n, d in generated_fixed_data.items(): f.write(json.dumps({n: d}) + "\n")
+            local_jsonls.append(jp)
+            
+        if has_bias:
+            jp = os.path.join(temp_dir, "dynamic_bias.jsonl")
+            with open(jp, 'w', encoding='utf-8') as f:
+                for n, d in generated_bias_data.items(): f.write(json.dumps({n: d}) + "\n")
+            local_jsonls.append(jp)
+            
+        if has_omit:
+            jp = os.path.join(temp_dir, "dynamic_omit.jsonl")
+            with open(jp, 'w', encoding='utf-8') as f:
+                for n, d in generated_omit_data.items(): f.write(json.dumps({n: d}) + "\n")
+            local_jsonls.append(jp)
+
+        mpnn_flags = ""
+        if has_fixed: mpnn_flags += f" \\\n    --fixed_positions_jsonl {task_dir}dynamic_fixed.jsonl"
+        if has_bias: mpnn_flags += f" \\\n    --bias_AA_jsonl {task_dir}dynamic_bias.jsonl"
+        if has_omit: mpnn_flags += f" \\\n    --omit_AA_jsonl {task_dir}dynamic_omit.jsonl"
+
+        # 🌟 核心：注入变长后的真实骨架约束对齐视图！
+        align_str = generate_alignment_comments(rfd_parsed_dict, generated_fixed_data, generated_bias_data)
+
+        bash_script = f"""#!/bin/bash\n{align_str}
+# ============================================================================
+# 动态匹配引擎 Phase 2: ProteinMPNN
+# ============================================================================
 set -e
-export CUDA_VISIBLE_DEVICES="{self.input_gpu_id.text().strip()}"
-source {self.input_conda_sh.text().strip()}
-conda activate {self.input_mpnn_env.text().strip()}
+export CUDA_VISIBLE_DEVICES="{args.gpu_id.strip()}"
+MPNN_SCRIPT="{args.mpnn_path.strip()}"
 
-RFD_OUT="{server_dir}rfd_out"
-MPNN_OUT="{server_dir}mpnn_out"
-mkdir -p $MPNN_OUT
+INPUT_DIR="{task_dir}mpnn_inputs"
+OUT_DIR="{task_dir}design_output/mpnn_out"
+LOG_DIR="{task_dir}logs"
+LOG_FILE="$LOG_DIR/master_pipeline.log"
 
-echo ">> 开始逐个读取 RF 骨架并进行序列设计..."
-for PDB_FILE in $RFD_OUT/*.pdb; do
+mkdir -p $INPUT_DIR $OUT_DIR $LOG_DIR
+echo $$ > "{task_dir}main_pipeline.pid"
+
+{{
+echo "=========================================================="
+echo "🚀 [Start] ProteinMPNN 设计开始时间: $(date)"
+echo "=========================================================="
+source {args.conda_sh.strip()}
+conda activate {args.mpnn_env.strip()}
+
+echo ">> 开始逐个读取筛选的 RF 骨架并进行序列设计..."
+for PDB_FILE in $INPUT_DIR/*.pdb; do
     if [ -f "$PDB_FILE" ]; then
         BASENAME=$(basename "$PDB_FILE" .pdb)
-        
         echo "   正在为 $BASENAME 设计序列..."
-        python {self.input_mpnn_path.text().strip()} \\
+        python $MPNN_SCRIPT \\
             --pdb_path "$PDB_FILE" \\
-            --out_folder $MPNN_OUT \\
-            --num_seq_per_target {self.input_seq_per_target.text()} \\
+            --out_folder $OUT_DIR \\
+            --num_seq_per_target {int(args.seq_per_target)} \\
             --sampling_temp 0.1 \\
-            --omit_AAs "{self.input_omit_aa.text()}" \\
-            --batch_size 1 {mpnn_flags} \\
-            >> {server_dir}proteinmpnn.log 2>&1
+            --omit_AAs "{args.omit_aa}" \\
+            --batch_size 1 {mpnn_flags} &
+        
+        STEP_PID=$!
+        echo $STEP_PID > "{task_dir}current_step.pid"
+        wait $STEP_PID
     fi
 done
 
-echo "✅ ProteinMPNN 序列设计圆满结束！请前往 $MPNN_OUT/seqs 查看结果。"
+echo "=========================================================="
+echo "🏁 [End] ProteinMPNN 结束时间: $(date)"
+echo "=========================================================="
+echo "✅ MPNN 生成完成！打包 mpnn_out 回传前端..."
+cd {task_dir}
+tar -czf mpnn_bundle.tar.gz design_output/mpnn_out/ logs/
+}} 2>&1 | tee -a $LOG_FILE
+
+echo "===BUNDLE_READY==="
 """
-            self.mpnn_display.setPlainText(mpnn_bash)
-            self.stacked_widget.setCurrentWidget(self.mpnn_display)
-            self.pivot.setCurrentItem('mpnnInterface')
-
-        except Exception as e:
-            self.log(f"❌ 发生致命错误 (可能 PDB 完全不存在): {str(e)}", "warn")
-
-    def export_all(self):
-        rfd_content = self.rfd_display.toPlainText().strip()
-        mpnn_content = self.mpnn_display.toPlainText().strip()
+        sh_path = os.path.join(temp_dir, "2_run_mpnn.sh")
+        with open(sh_path, 'w', encoding='utf-8', newline='\n') as f: 
+            f.write(bash_script.replace('\r\n', '\n').replace('\r', ''))
         
-        if not rfd_content and not mpnn_content:
-            QMessageBox.warning(self, "警告", "没有可导出的内容！")
-            return
+        with open(manifest_mpnn, 'w', encoding='utf-8') as f:
+            json.dump({"pdbs": rfd_pdb_paths, "jsonls": local_jsonls, "sh": sh_path, "task_dir": task_dir}, f)
+
+        print(f"[OutputCode] .cache/2_run_mpnn.sh")
+        print("\n" + "="*50)
+        print(" 🛠️ MPNN 动态匹配编译完成！请在上方代码区检查真实落位对齐后，点击 [4. 跑 MPNN]。")
+        print("="*50)
+
+
+    # =========================================================================
+    # Phase 4: 跑 MPNN 并回收 (Action: run_mpnn)
+    # =========================================================================
+    elif args.action == 'run_mpnn':
+        if not HAS_SSH: print("❌ [Fatal] 缺少 paramiko"); sys.exit(1)
+        if not os.path.exists(manifest_mpnn): print("❌ [Fatal] 未找到 mpnn_manifest！请先编译"); sys.exit(1)
             
-        raw_export_dir = QFileDialog.getExistingDirectory(self, "选择导出文件夹")
-        if not raw_export_dir: return
-            
+        with open(manifest_mpnn, 'r', encoding='utf-8') as f: manifest = json.load(f)
+        task_dir = manifest['task_dir']
+
         try:
-            export_dir = os.path.abspath(raw_export_dir)
-            if not os.path.exists(export_dir):
-                os.makedirs(export_dir, exist_ok=True)
-                
-            exported_files = []
+            ssh = paramiko.SSHClient()
+            ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+            ssh.connect(args.ssh_host, port=int(args.ssh_port), username=args.ssh_user, password=args.ssh_pwd, timeout=10)
             
-            if rfd_content:
-                sh_path = os.path.join(export_dir, "1_run_rfd.sh")
-                with open(sh_path, 'w', encoding='utf-8', newline='\n') as f:
-                    f.write(rfd_content + "\n")
-                exported_files.append("📜 1_run_rfd.sh")
-                
-            if mpnn_content:
-                sh_path = os.path.join(export_dir, "2_run_mpnn.sh")
-                with open(sh_path, 'w', encoding='utf-8', newline='\n') as f:
-                    f.write(mpnn_content + "\n")
-                exported_files.append("📜 2_run_mpnn.sh")
+            sftp = ssh.open_sftp()
+            print(f"📂 [SSH] 初始化云端沙盒目录: {task_dir}mpnn_inputs")
+            _, stdout, _ = ssh.exec_command(f"mkdir -p {task_dir}mpnn_inputs")
+            stdout.channel.recv_exit_status()
+
+            print(f"⬆️ [SFTP] 投递精选 PDB、动态 JSONL 约束和脚本至云端...")
+            sftp.put(manifest['sh'], f"{task_dir}2_run_mpnn.sh")
+            _, stdout, _ = ssh.exec_command(f"chmod +x {task_dir}2_run_mpnn.sh")
+            stdout.channel.recv_exit_status()
             
-                if self.generated_fixed_data:
-                    json_path = os.path.join(export_dir, "dynamic_fixed.jsonl")
-                    with open(json_path, 'w', encoding='utf-8') as f:
-                        f.write(json.dumps(self.generated_fixed_data) + "\n")
-                    exported_files.append("📦 dynamic_fixed.jsonl (单行防覆盖版)")
-                    
-                if self.generated_bias_data:
-                    json_path = os.path.join(export_dir, "dynamic_bias.jsonl")
-                    with open(json_path, 'w', encoding='utf-8') as f:
-                        f.write(json.dumps(self.generated_bias_data) + "\n")
-                    exported_files.append("📦 dynamic_bias.jsonl (单行防覆盖版)")
-                    
-                if self.generated_omit_data:
-                    json_path = os.path.join(export_dir, "dynamic_omit.jsonl")
-                    with open(json_path, 'w', encoding='utf-8') as f:
-                        f.write(json.dumps(self.generated_omit_data) + "\n")
-                    exported_files.append("📦 dynamic_omit.jsonl (单行防覆盖版)")
-                        
-            QMessageBox.information(self, "导出成功", f"✅ 成功导出以下文件：\n\n" + "\n".join(exported_files))
+            for f in manifest['pdbs']: sftp.put(f, f"{task_dir}mpnn_inputs/{os.path.basename(f)}")
+            for f in manifest['jsonls']: sftp.put(f, f"{task_dir}{os.path.basename(f)}")
             
-        except Exception as e:
-            QMessageBox.critical(self, "保存失败", f"系统原话：{str(e)}")
+            print(f"🔥 [SSH] 开始下发执行命令，前方发来高能日志流...\n")
+            print("—" * 50)
+            ssh.exec_command(f"sed -i 's/\\r$//' {task_dir}2_run_mpnn.sh")
+            stdin, stdout, stderr = ssh.exec_command(f"bash -lc 'bash {task_dir}2_run_mpnn.sh'", get_pty=True)
+            
+            for line in iter(stdout.readline, ""):
+                if not line: break
+                clean_line = line.strip()
+                if clean_line == "===BUNDLE_READY===": break
+                if clean_line: print(f"[Cluster] {clean_line}", flush=True)
+
+            print("—" * 50)
+            print(f"\n⬇️ [SFTP] MPNN 运算结束！正在将序列包下载至前端...")
+            
+            remote_tar = f"{task_dir}mpnn_bundle.tar.gz"
+            local_tar = os.path.join(temp_dir, "mpnn_bundle.tar.gz")
+            sftp.get(remote_tar, local_tar)
+            sftp.close(); ssh.close()
+
+            try:
+                with tarfile.open(local_tar, "r:gz") as tar: tar.extractall(path=temp_dir)
+                for target_dir in ["design_output", "logs"]:
+                    extract_dir = os.path.join(temp_dir, target_dir)
+                    if os.path.exists(extract_dir):
+                        for root, _, files in os.walk(extract_dir):
+                            for file in files:
+                                ext = os.path.splitext(file)[1].lower()
+                                if ext in ['.pdb', '.fa', '.fasta', '.log']:
+                                    rel_path = os.path.relpath(os.path.join(root, file), workspace)
+                                    print(f"[OutputFile] {rel_path.replace(os.sep, '/')}")
+            except Exception as tar_err: print(f"❌ 本地解压失败: {tar_err}")
+
+            print(f"\n🎉 [Success] MPNN 序列重设计已全量回收！")
+
+        except Exception as e: print(f"❌ [SSH Error] 执行崩溃: {e}"); sys.exit(1)
 
 
-class DynamicMatcherPlugin(BasePlugin):
-    plugin_id = "dynamic_matcher"
-    plugin_name = "变长设计与动态匹配引擎"
-    icon = "🧬"
-    trigger_tag = "蛋白设计"
+    # =========================================================================
+    # Phase 5: 显卡占用探针 (Action: check_gpu)
+    # =========================================================================
+    elif args.action == 'check_gpu':
+        if not HAS_SSH: print("❌ [Fatal] 缺少 paramiko"); sys.exit(1)
+        print(f"\n" + "="*50)
+        print(f"👁️ [SSH] 正在握手云端节点: {args.ssh_host} 并查询显卡状态...")
+        try:
+            ssh = paramiko.SSHClient()
+            ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+            ssh.connect(args.ssh_host, port=int(args.ssh_port), username=args.ssh_user, password=args.ssh_pwd, timeout=10)
+            print("—" * 50)
+            stdin, stdout, stderr = ssh.exec_command("nvidia-smi")
+            for line in iter(stdout.readline, ""): print(line.strip('\n'), flush=True)
+            print("—" * 50)
+            ssh.close()
+        except Exception as e: print(f"❌ [SSH Error] 获取显卡状态失败: {e}"); sys.exit(1)
 
-    def get_ui(self, parent=None):
-        return DynamicMatcherUI(parent, is_setting_mode=False)
+    # =========================================================================
+    # Phase 6: 紧急防碰撞急停机制 (Action: abort)
+    # =========================================================================
+    elif args.action == 'abort':
+        if not HAS_SSH: print("❌ [Fatal] 缺少 paramiko"); sys.exit(1)
+        print(f"\n" + "="*50)
+        print(f"🛑 [SSH] 危险！接收到急停指令。正在建立高优抢占式连接...")
+        try:
+            ssh = paramiko.SSHClient()
+            ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+            ssh.connect(args.ssh_host, port=int(args.ssh_port), username=args.ssh_user, password=args.ssh_pwd, timeout=10)
+            
+            kill_script = f'''
+            if [ -f "{task_dir}current_step.pid" ]; then
+                CHILD_PID=$(cat "{task_dir}current_step.pid")
+                kill -9 $CHILD_PID 2>/dev/null || true
+                echo "✅ 已精确击杀当前计算子进程 (PID: $CHILD_PID)"
+            fi
+            if [ -f "{task_dir}main_pipeline.pid" ]; then
+                MAIN_PID=$(cat "{task_dir}main_pipeline.pid")
+                kill -9 $MAIN_PID 2>/dev/null || true
+                echo "✅ 已精确击杀流水线主控进程 (PID: $MAIN_PID)"
+            fi
+            '''
+            stdin, stdout, stderr = ssh.exec_command(kill_script)
+            for line in stdout.readlines(): print(line.strip(), flush=True)
+            print("✅ 您的设计任务已被安全中止，未误伤其他用户的进程。")
+            ssh.close()
+        except Exception as e: print(f"❌ [SSH Error] 紧急中断下发失败: {e}"); sys.exit(1)
 
-    def get_setting_card(self, parent=None):
-        card = PrimaryPushSettingCard(
-            "配置默认服务器路径参数", 
-            FIF.SETTING, 
-            "🧬 变长设计与动态匹配引擎", 
-            "修改默认的 Conda 环境、脚本路径和工作目录等偏好设置", 
-            parent
-        )
-
-        def show_global_settings_dialog():
-            dlg = QDialog(card)
-            dlg.setWindowTitle("变长设计 全局默认参数预设中心")
-            dlg.resize(600, 800)
-            dlg.setStyleSheet("QDialog { background-color: #F9F9F9; }")
-            layout = QVBoxLayout(dlg)
-            settings_ui = DynamicMatcherUI(dlg, is_setting_mode=True)
-            layout.addWidget(settings_ui)
-            dlg.exec_()
-
-        card.clicked.connect(show_global_settings_dialog)
-        return card
-
-    @staticmethod
-    def run(file_path, archive_dir):
-        return "", "【变长设计与动态匹配引擎】这是一个高度交互式插件，请在 UI 界面中完成配置与生成。"
+    sys.exit(0)

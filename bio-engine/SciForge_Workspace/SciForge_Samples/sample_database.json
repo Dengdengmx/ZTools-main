@@ -3,7 +3,7 @@
         {
             "name": "111",
             "type": "🧬 质粒 (Plasmid)",
-            "location_str": "常温抽屉 / 储藏柜 > 新容器 [孔位: A2]",
+            "location_str": "常温抽屉 / 储藏柜 > cont_8ebb66 [孔位: A2]",
             "vol": 50.0,
             "unit": "μL",
             "ft_count": 5,

@@ -1,0 +1,54 @@
+{
+  "equip_drawer": {
+    "name": "常温抽屉 / 储藏柜",
+    "layout": "Grid",
+    "rows": 5,
+    "cols": 6,
+    "desc": "常温存放区。用于存放常规离心管、枪头、室温保存的试剂与常温样本盒等。",
+    "icon": "folder",
+    "containers": {},
+    "inner_boxes": {}
+  },
+  "equip_chromatography": {
+    "name": "4℃ 层析柜",
+    "layout": "Grid",
+    "rows": 5,
+    "cols": 6,
+    "desc": "冷藏层析区。用于放置 AKTA 纯化设备、层析柱、大体积蛋白缓冲液等。",
+    "icon": "tiles",
+    "containers": {},
+    "inner_boxes": {}
+  },
+  "equip_fridge_4_20": {
+    "name": "4℃ / -20℃ 冰箱",
+    "layout": "Grid",
+    "rows": 5,
+    "cols": 6,
+    "desc": "日常冷藏冷冻区。用于存放抗体、酶类、日常实验试剂及短期周转样本。",
+    "icon": "calendar",
+    "containers": {},
+    "inner_boxes": {}
+  },
+  "equip_fridge_80": {
+    "name": "-80℃ 超低温冰箱",
+    "layout": "Grid",
+    "rows": 5,
+    "cols": 6,
+    "desc": "核心资产区。用于长期冻存甘油菌、质粒、细胞株、珍贵蛋白样本等。",
+    "icon": "snowflake",
+    "containers": {
+      "cont_a4322b": {
+        "name": "新容器",
+        "type": "rack",
+        "r": 0,
+        "c": 0,
+        "rs": 1,
+        "cs": 1,
+        "layers": 5,
+        "boxes": 4,
+        "id": "cont_a4322b"
+      }
+    },
+    "inner_boxes": {}
+  }
+}
